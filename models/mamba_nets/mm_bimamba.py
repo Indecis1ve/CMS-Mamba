@@ -90,7 +90,6 @@ class Mamba(nn.Module):
         self.a_time_gate = nn.Linear(self.d_inner, 1, bias=True, **factory_kwargs)
         self.v_time_gate = nn.Linear(self.d_inner, 1, bias=True, **factory_kwargs)
         
-        # 偏置初始化为正，确保训练初期默认所有特征都是“健康”的，等同于 Baseline
         with torch.no_grad():
             self.a_time_gate.bias.fill_(2.0)
             self.v_time_gate.bias.fill_(2.0)
@@ -157,24 +156,27 @@ class Mamba(nn.Module):
         v_x_dbl = self.v_x_proj(v_x_flat)
         v_dt, v_B, v_C = torch.split(v_x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
 
-        # 评估自身健康状态 (接近 1 为健康，接近 0 为缺失)
+        # 1. 评估自身健康状态
         a_health_gate = torch.sigmoid(self.a_time_gate(a_x_flat))
         v_health_gate = torch.sigmoid(self.v_time_gate(v_x_flat))
 
+        # 2. 投影出原始步长 dt_proj (包含 bias)
+        a_dt_proj = (self.a_dt_proj.weight @ a_dt.t()) + rearrange(self.a_dt_proj.bias.to(dtype=a_dt.dtype), "d -> d 1")
+        v_dt_proj = (self.v_dt_proj.weight @ v_dt.t()) + rearrange(self.v_dt_proj.bias.to(dtype=v_dt.dtype), "d -> d 1")
 
-        # 投影出原始步长 dt
-        a_dt_proj = self.a_dt_proj.weight @ a_dt.t()
-        v_dt_proj = self.v_dt_proj.weight @ v_dt.t()
+        # 3. 计算 Base Step (通过 Softplus，严格对应公式: \Delta_base = ln(1 + exp(\Delta_proj)))
+        a_dt_base = F.softplus(a_dt_proj)
+        v_dt_base = F.softplus(v_dt_proj)
 
-	# 将局部变量挂载到实例属性上，供外部抓取
+        # 4. Multiplicative Gating (乘法门控，严格对应公式: \Delta_t = \alpha_t * \Delta_base)
+        a_dt_frozen = a_dt_base * a_health_gate.t()
+        v_dt_frozen = v_dt_base * v_health_gate.t()
+
         self.vis_alpha_a = a_health_gate.detach().cpu()
         self.vis_alpha_v = v_health_gate.detach().cpu()
-        self.vis_a_dt = a_dt.detach().cpu()
-        self.vis_v_dt = v_dt.detach().cpu()
+        self.vis_a_dt = a_dt_frozen.detach().cpu() # 直接抓取最终 frozen 后的实际步长
+        self.vis_v_dt = v_dt_frozen.detach().cpu()
 
-        # 当健康度 gate 趋近于 0 时，施加极大的负向偏移 (-20.0)，迫使后续 F.softplus(dt) 彻底归零
-        a_dt_frozen = a_dt_proj - (1.0 - a_health_gate.t()) * 20.0
-        v_dt_frozen = v_dt_proj - (1.0 - v_health_gate.t()) * 20.0
 
         a_dt = rearrange(a_dt_frozen, "d (b l) -> b d l", l=seqlen)
         a_B = rearrange(a_B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
@@ -185,8 +187,9 @@ class Mamba(nn.Module):
         v_C = rearrange(v_C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         # ==========================================================
 
-        a_y = selective_scan_fn(a_x, a_dt, A, a_B, a_C, self.a_D.float(), z=a_z, delta_bias=self.a_dt_proj.bias.float(), delta_softplus=True)
-        v_y = selective_scan_fn(v_x, v_dt, A, v_B, v_C, self.v_D.float(), z=v_z, delta_bias=self.v_dt_proj.bias.float(), delta_softplus=True)
+
+        a_y = selective_scan_fn(a_x, a_dt, A, a_B, a_C, self.a_D.float(), z=a_z, delta_bias=None, delta_softplus=False)
+        v_y = selective_scan_fn(v_x, v_dt, A, v_B, v_C, self.v_D.float(), z=v_z, delta_bias=None, delta_softplus=False)
 
         a_y = rearrange(a_y, "b d l -> b l d")
         a_out = self.a_out_proj(a_y)
