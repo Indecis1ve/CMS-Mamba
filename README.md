@@ -7,40 +7,38 @@
 
 Official PyTorch implementation of **CMS-Mamba**, a **Context-Maintained Surviving Mamba** framework for robust multimodal sentiment analysis under extreme modality missingness.
 
-CMS-Mamba is designed for real-world multimodal affective computing scenarios where text, audio, and visual signals may be partially or even completely corrupted due to sensor failure, camera occlusion, packet loss, privacy masking, or unstable edge-device deployment.
+CMS-Mamba targets real-world multimodal affective computing scenarios where text, audio, and visual streams may be partially or completely corrupted due to sensor failure, camera occlusion, packet loss, privacy masking, or unstable edge deployment.
 
-Unlike conventional missing-modality methods that rely on reconstruction or zero-padding, CMS-Mamba introduces a hierarchical defense system to stabilize State Space Model dynamics under severe data degradation.
+Instead of relying on reconstruction or simple zero-padding, CMS-Mamba introduces a hierarchical defense system to stabilize Mamba-based multimodal fusion under severe data degradation.
 
 ---
 
 ## 🔥 Highlights
 
 - **Extreme Missing-Modality Robustness**  
-  Supports robustness evaluation from missing rate `η = 0.0` to `η = 1.0`, including the catastrophic case where text, audio, and vision are simultaneously corrupted.
+  Supports robustness evaluation from missing rate `η = 0.0` to `η = 1.0`, including catastrophic simultaneous text-audio-vision corruption.
 
 - **Spatiotemporal Orthogonal Defense**  
-  A three-layer defense framework consisting of:
+  A hierarchical defense framework consisting of:
   - **LMMT**: Learnable Missing Modality Tokens
   - **DTF**: Dynamic Time-Freezing
   - **RNL**: Representation Normalization Lock
 
 - **State-Space Stability under Missingness**  
-  CMS-Mamba directly addresses zero-value bias, hidden-state degradation, and integral explosion in Mamba-based multimodal fusion.
+  Addresses zero-value bias, state drift, and feature-magnitude instability in Mamba-based multimodal sentiment analysis.
 
-- **Long-Sequence Multimodal Modeling**  
-  Efficiently handles long acoustic and visual streams, especially on CMU-MOSEI where sequences can reach up to 500 frames.
+- **Text-Aware Long-Sequence Modeling**  
+  Uses CTC-inspired text-aware modality mixing to align long acoustic and visual streams with the text sequence, especially on CMU-MOSEI where sequences can reach 500 frames.
 
 - **Edge Deployment Friendly**  
-  Verified on NVIDIA Jetson AGX Orin, CMS-Mamba significantly reduces memory footprint and avoids Out-Of-Memory failures compared with the baseline TF-Mamba.
+  Verified on NVIDIA Jetson AGX Orin. CMS-Mamba reduces measured peak CUDA memory footprint and avoids the OOM failure encountered by the reproduced TF-Mamba baseline.
 
-- **Multilingual Dataset Support**  
-  Compatible with English datasets such as **CMU-MOSI** and **CMU-MOSEI**, as well as the Chinese multimodal sentiment dataset **CH-SIMS**.
+- **Cross-Lingual Dataset Support**  
+  Supports English datasets **CMU-MOSI**, **CMU-MOSEI**, and the Chinese multimodal sentiment dataset **CH-SIMS**.
 
 ---
 
 ## 🧠 Method Overview
-
-CMS-Mamba is built upon a text-guided Mamba fusion architecture and enhances it with a hierarchical survival mechanism.
 
 ```text
 Input Modalities
@@ -54,7 +52,7 @@ Spatial Defense
         │
         ▼
 Text-Aware Modality Mixing
- └── CTC-based temporal alignment
+ └── CTC-inspired temporal pseudo-alignment
         │
         ▼
 Temporal Defense
@@ -62,7 +60,7 @@ Temporal Defense
         │
         ▼
 Deep Query Fusion
- └── TQ-Mamba with text-guided query reasoning
+ └── RoPE-enhanced cross-attention + TQ-Mamba
         │
         ▼
 Numerical Defense
@@ -76,40 +74,32 @@ Sentiment Prediction
 
 ## ✨ Key Components
 
-### 1. LMMT: Learnable Missing Modality Tokens
+### LMMT: Learnable Missing Modality Tokens
 
-**Learnable Missing Modality Tokens** replace zero-padded audio and visual frames with trainable geometric anchors.
+LMMT replaces zero-padded missing audio and visual frames with trainable modality-specific tokens.
 
-Instead of feeding pure zero vectors into the model, LMMT provides stable non-zero representations for missing continuous modalities, preventing the hidden feature manifold from collapsing.
+This prevents continuous acoustic and visual streams from collapsing into high-dimensional zero vectors. For text, missing non-special tokens are replaced by `[UNK]`, while `[CLS]` and `[SEP]` are preserved to maintain valid BERT sentence boundaries.
 
-For text, missing tokens are replaced by `[UNK]`, while `[CLS]` and `[SEP]` are preserved to maintain valid BERT sentence boundaries.
+### DTF: Dynamic Time-Freezing
 
----
+DTF is embedded into the Mamba state-space engine as a missing-aware step-size controller.
 
-### 2. DTF: Dynamic Time-Freezing
+It regulates the effective discretization step size of the Mamba ODE system. Severely uninformative inputs can drive the state update toward a near-frozen regime, while LMMT-stabilized missing frames can still be integrated through a small and stable positive step.
 
-**Dynamic Time-Freezing** is embedded into the Mamba state-space engine.
+### RNL: Representation Normalization Lock
 
-When missing or highly degraded frames are detected, DTF dynamically adjusts the discretization step size of the Mamba ODE system, forcing the state transition matrix to approach an identity mapping.
+RNL is applied before the final regression head.
 
-As a result, historical emotional context is preserved rather than being overwritten by corrupted inputs.
-
----
-
-### 3. RNL: Representation Normalization Lock
-
-**Representation Normalization Lock** is applied before the final regression head.
-
-It suppresses numerical divergence and feature magnitude explosion caused by long-term integration of missing-modality representations, improving regression stability under extreme missingness.
+It suppresses feature-scale drift and numerical divergence caused by long-term processing of low-variance or missing-modality representations.
 
 ---
 
 ## 📁 Directory Structure
 
 ```text
-CMSmamba/
+CMS-Mamba/
 ├── ckpt/
-├── configs/                      # YAML configuration files for training and evaluation
+├── configs/
 │   ├── eval_mosei.yaml
 │   ├── eval_mosi.yaml
 │   ├── eval_sims.yaml
@@ -123,7 +113,7 @@ CMSmamba/
 │   ├── optimizer.py
 │   ├── scheduler.py
 │   └── utils.py
-├── data/                       # Dataset directory, manually prepared
+├── data/
 ├── models/
 │   ├── mamba_nets/
 │   │   ├── attention.py
@@ -139,39 +129,34 @@ CMSmamba/
 ├── environment.yml
 ├── robust_evaluation.py
 └── train.py
-
 ```
 
 ---
 
 ## ⚙️ Installation
 
-### 1. Clone the Repository
+### 1. Clone the repository
 
 ```bash
-git clone https://github.com/YourUsername/CMS-Mamba.git
+git clone https://github.com/Indecis1ve/CMS-Mamba.git
 cd CMS-Mamba
 ```
 
-### 2. Create the Conda Environment
+### 2. Create the Conda environment
 
 ```bash
 conda env create -f environment.yml
 conda activate CMSmamba
 ```
 
-### 3. Install Mamba Dependencies
-
-CMS-Mamba relies on `causal-conv1d` and `mamba-ssm`.
+### 3. Install Mamba dependencies
 
 ```bash
 pip install causal-conv1d
 pip install mamba-ssm
 ```
 
-> **Note**
->
-> If you deploy CMS-Mamba on edge platforms such as NVIDIA Jetson AGX Orin, Jetson Orin NX, or other ARM-based CUDA devices, it is recommended to compile `causal-conv1d` and `mamba-ssm` from source to avoid binary compatibility issues.
+> For NVIDIA Jetson AGX Orin, Jetson Orin NX, or other ARM-based CUDA devices, compiling `causal-conv1d` and `mamba-ssm` from source is recommended to avoid binary compatibility issues.
 
 ---
 
@@ -179,37 +164,33 @@ pip install mamba-ssm
 
 Please manually download and preprocess the multimodal feature files for each dataset.
 
-The processed `.pkl` files should be placed in the corresponding dataset directories.
+Place the processed `.pkl` files according to the paths configured in `configs/*.yaml`.
 
 Example:
 
 ```text
-data/CMU_MOSI/Processed/unaligned_50.pkl
-data/CMU_MOSEI/Processed/unaligned_50.pkl
-data/CH_SIMS/Processed/unaligned_50.pkl
-```
-
-Recommended data organization:
-
-```text
 data/
 ├── CMU_MOSI/
-│       └── unaligned_50.pkl
-│
+│   └── unaligned_50.pkl
 ├── CMU_MOSEI/
-│       └── unaligned_50.pkl
-│
+│   └── unaligned_50.pkl
 └── CH_SIMS/
-        └── unaligned_50.pkl
+    └── unaligned_50.pkl
 ```
+
+The datasets used in this project are:
+
+- **CMU-MOSI**
+- **CMU-MOSEI**
+- **CH-SIMS**
+
+CMU-MOSI and CMU-MOSEI can be obtained through the CMU Multimodal SDK. CH-SIMS is available from its official repository.
 
 ---
 
 ## 🤗 Offline BERT Weights
 
-To support offline HPC clusters and edge devices without internet access, CMS-Mamba uses local BERT loading.
-
-Please download the required HuggingFace BERT weights and place them in the project root directory.
+CMS-Mamba supports local BERT loading for offline HPC clusters and edge devices.
 
 For English datasets:
 
@@ -232,7 +213,6 @@ CMS-Mamba/
 │   ├── pytorch_model.bin
 │   ├── tokenizer.json
 │   └── vocab.txt
-│
 └── bert-base-chinese/
     ├── config.json
     ├── pytorch_model.bin
@@ -244,51 +224,35 @@ CMS-Mamba/
 
 ## 🚀 Quick Start
 
-### 1. Training on CMU-MOSI
+### Train on CMU-MOSI
 
 ```bash
 python train.py --config_file configs/train_mosi.yaml
 ```
 
-The best checkpoint will be saved to:
-
-```text
-ckpt/mosi/
-```
-
----
-
-### 2. Training on CMU-MOSEI
+### Train on CMU-MOSEI
 
 ```bash
 python train.py --config_file configs/train_mosei.yaml
 ```
 
-The best checkpoint will be saved to:
-
-```text
-ckpt/mosei/
-```
-
----
-
-### 3. Training on CH-SIMS
+### Train on CH-SIMS
 
 ```bash
 python train.py --config_file configs/train_sims.yaml
 ```
 
-The best checkpoint will be saved to:
+Checkpoints are saved under:
 
 ```text
-ckpt/sims/
+ckpt/
 ```
 
 ---
 
 ## 🧪 Robustness Evaluation
 
-CMS-Mamba supports robustness evaluation across a full missing-rate spectrum from `η = 0.0` to `η = 1.0`.
+CMS-Mamba supports evaluation across missing rates from `η = 0.0` to `η = 1.0`.
 
 ### Evaluate on CMU-MOSI
 
@@ -308,18 +272,15 @@ python robust_evaluation.py --config_file configs/eval_mosei.yaml
 python robust_evaluation.py --config_file configs/eval_sims.yaml
 ```
 
-The evaluation results will be saved in:
+Results are saved in:
 
 ```text
 log/results/
 ```
 
-
 ---
 
 ## 🔬 Missing-Modality Protocol
-
-During robustness evaluation, CMS-Mamba simulates missingness only on the test set.
 
 The missing rate is denoted as `η`.
 
@@ -327,14 +288,17 @@ The missing rate is denoted as `η`.
 | --- | --- |
 | `η = 0.0` | Complete multimodal input |
 | `0.0 < η < 1.0` | Partial missing text, audio, and vision |
-| `η = 1.0` | Catastrophic simultaneous missingness |
+| `η = 1.0` | Catastrophic simultaneous text-audio-vision missingness |
 
 At `η = 1.0`:
 
 - Non-special textual tokens are replaced by `[UNK]`.
-- Audio frames are replaced by zero-padded void vectors.
-- Visual frames are replaced by zero-padded void vectors.
-- CMS-Mamba activates its spatial, temporal, and numerical defense mechanisms to prevent representation collapse.
+- `[CLS]` and `[SEP]` are preserved.
+- Audio frames are converted into zero-padded void vectors before LMMT substitution.
+- Visual frames are converted into zero-padded void vectors before LMMT substitution.
+- CMS-Mamba activates spatial, temporal, and numerical defense mechanisms.
+
+CMS-Mamba does not recover missing semantics from absent modalities. Instead, it maintains a stable residual fallback state through learned structural priors, LMMT anchors, and stabilized ODE updates.
 
 ---
 
@@ -342,33 +306,31 @@ At `η = 1.0`:
 
 ### Complete Data Performance
 
-CMS-Mamba remains competitive under the ideal complete-data setting.
-
 | Dataset | MAE ↓ | Corr ↑ | Acc-2 ↑ | F1 ↑ |
 | --- | ---: | ---: | ---: | ---: |
 | CMU-MOSI | 0.7496 | 0.7796 | 83.23 | 82.81 |
 | CMU-MOSEI | 0.5536 | 0.7598 | 85.61 | 85.56 |
 
-> The Acc-2 and F1 values follow the commonly used non-negative / negative-positive setting reported in multimodal sentiment analysis.
+> Acc-2 and F1 are reported using the commonly used non-negative / negative-positive setting.
 
 ---
 
 ### Extreme Missingness Performance
 
-Under catastrophic simultaneous text-audio-vision missingness, CMS-Mamba maintains stable regression and classification behavior.
+Performance under catastrophic simultaneous text-audio-vision missingness (`η = 1.0`):
 
-| Dataset | Missing Rate | Has0 F1 ↑ | Non0 F1 ↑ | Mult-5 ↑ | MAE ↓ |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| CMU-MOSI | `η = 1.0` | 0.5335 | 0.5430 | 0.2128 | 1.3992 |
-| CMU-MOSEI | `η = 1.0` | 0.5899 | 0.4851 | 0.4136 | 0.8389 |
+| Dataset | Has0 F1 ↑ | Non0 F1 ↑ | Mult-5 ↑ | MAE ↓ |
+| --- | ---: | ---: | ---: | ---: |
+| CMU-MOSI | 0.5335 | 0.5430 | 0.2128 | 1.3992 |
+| CMU-MOSEI | 0.5899 | 0.4851 | 0.4136 | 0.8389 |
 
-On CMU-MOSEI, the baseline TF-Mamba suffers severe degradation under `η = 1.0`, with MAE increasing to `0.9485`, while CMS-Mamba suppresses the error to `0.8389`.
+On CMU-MOSEI, CMS-Mamba reduces MAE from `0.9485` for the reproduced TF-Mamba baseline to `0.8389`.
 
 ---
 
 ## 📈 Average Robustness
 
-Average robustness is measured across multiple missing rates from `η = 0.0` to `η = 0.9`.
+Average performance across missing rates `η ∈ [0.0, 0.9]`:
 
 | Dataset | Model | Mult-7 ↑ | Mult-5 ↑ | MAE ↓ |
 | --- | --- | ---: | ---: | ---: |
@@ -381,30 +343,30 @@ Average robustness is measured across multiple missing rates from `η = 0.0` to 
 
 ## 🧩 Ablation Study
 
-The ablation study verifies the contribution of each defense component.
+Ablation results on **CMU-MOSEI**:
 
 | Architecture | Ideal MAE ↓ | Extreme MAE ↓ | Has0 F1 ↑ | Non0 F1 ↑ |
 | --- | ---: | ---: | ---: | ---: |
-| TF-Mamba Baseline | 0.7884 | **1.3736** | 0.3932 | 0.4231 |
-| w/o LMMT | 0.7742 | 1.4327 | 0.2767 | 0.2507 |
-| w/o RNL | **0.7470** | 1.5169 | 0.5097 | 0.5214 |
-| w/o DTF | 0.7970 | 1.5062 | 0.3932 | 0.4231 |
-| w/ Contrastive Loss | 0.8028 | 1.3857 | 0.3932 | 0.4231 |
-| CMS-Mamba Full | 0.7496 | 1.3992 | **0.5335** | **0.5430** |
+| TF-Mamba Baseline | 0.5560 | 0.9485 | 0.5892 | 0.4847 |
+| w/o LMMT | 0.5562 | 1.0236 | 0.4785 | 0.3921 |
+| w/o RNL | **0.5514** | 1.0178 | **0.5973** | **0.4926** |
+| w/o DTF | 0.5603 | 0.9834 | 0.5864 | 0.4819 |
+| w/ Contrastive Loss | 0.5639 | 0.9547 | 0.5878 | 0.4832 |
+| CMS-Mamba Full | 0.5536 | **0.8389** | 0.5899 | 0.4851 |
 
 Key observations:
 
-- Removing **LMMT** causes severe classification boundary collapse.
-- Removing **DTF** leads to temporal integration instability.
-- Removing **RNL** causes regression error explosion under extreme missingness.
-- Adding contrastive loss does not improve robustness and may cause feature homogenization.
-- The full CMS-Mamba achieves the best classification survivability under catastrophic missingness.
+- Removing **LMMT** weakens the classification boundary under extreme missingness.
+- Removing **DTF** increases regression error under catastrophic corruption.
+- Removing **RNL** causes feature-scale instability and worsens extreme MAE.
+- Adding contrastive loss does not improve robustness in this setting.
+- The full CMS-Mamba achieves the best extreme MAE on CMU-MOSEI.
 
 ---
 
 ## 🌏 Cross-Lingual Generalization
 
-CMS-Mamba is also evaluated on the Chinese CH-SIMS dataset.
+Results on the Chinese **CH-SIMS** dataset:
 
 | Model | Setting | Acc-2 ↑ | Acc-3 ↑ | F1 ↑ | MAE ↓ |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -413,13 +375,13 @@ CMS-Mamba is also evaluated on the Chinese CH-SIMS dataset.
 | TF-Mamba | `η = 1.0` | 60.61 | 26.91 | - | **0.6513** |
 | CMS-Mamba | `η = 1.0` | **66.96** | **30.63** | - | 0.6550 |
 
-These results show that CMS-Mamba provides language-agnostic robustness against zero-value bias and state-space instability.
+CMS-Mamba improves classification robustness on CH-SIMS under both complete and catastrophic missing settings.
 
 ---
 
 ## ⚡ Edge Deployment Results
 
-CMS-Mamba is tested on an NVIDIA Jetson AGX Orin edge platform.
+CMS-Mamba is tested on **NVIDIA Jetson AGX Orin**.
 
 Environment:
 
@@ -430,20 +392,22 @@ PyTorch: 2.5.0
 CUDA: 12.6
 ```
 
-| Model | Batch Size | Latency ↓ | Throughput ↑ | VRAM ↓ | MAE ↓ | Has0 F1 ↑ |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| TF-Mamba | 16 | 90.51 ms | 176.78 samples/s | 1951.40 MB | 0.9482 | 0.1351 |
-| TF-Mamba | 32 | OOM | OOM | OOM | - | - |
-| CMS-Mamba | 16 | **79.70 ms** | **200.77 samples/s** | **648.89 MB** | **0.8380** | **0.5899** |
-| CMS-Mamba | 32 | 106.26 ms | 300.31 samples/s | 681.17 MB | 0.8379 | 0.5899 |
+| Model | Batch Size | Latency ↓ | Throughput ↑ | VRAM ↓ | Power | Temp | MAE ↓ | Has0 F1 ↑ |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| TF-Mamba | 16 | 90.51 ms | 176.78 samples/s | 1951.40 MB | 7.19 W | 49.96°C | 0.9482 | 0.1351 |
+| TF-Mamba | 32 | OOM | OOM | OOM | - | - | - | - |
+| CMS-Mamba | 16 | **79.70 ms** | **200.77 samples/s** | **648.89 MB** | 9.86 W | 52.27°C | **0.8380** | **0.5899** |
+| CMS-Mamba | 32 | 106.26 ms | 300.31 samples/s | 681.17 MB | 10.15 W | 52.19°C | 0.8379 | 0.5899 |
 
-CMS-Mamba reduces VRAM usage by nearly **66%** at batch size 16 and avoids the OOM failure encountered by the baseline at batch size 32.
+CMS-Mamba reduces measured peak CUDA memory footprint by **66.75%** at batch size 16 compared with the reproduced TF-Mamba baseline and remains executable at batch size 32, where the baseline encounters OOM.
+
+> The reported VRAM is the measured peak CUDA memory footprint under the tested Jetson runtime, not parameter memory alone.
 
 ---
 
 ## 🛠️ Configuration
 
-All experiments are controlled by YAML configuration files in the `configs/` directory.
+All experiments are controlled by YAML files in `configs/`.
 
 Example:
 
@@ -457,7 +421,6 @@ epochs: 50
 seed: 1111
 ```
 
-
 ---
 
 ## 📌 Recommended Workflow
@@ -467,16 +430,20 @@ seed: 1111
 conda env create -f environment.yml
 conda activate CMSmamba
 
-# 2. Prepare datasets
-# Put processed .pkl files into the data directory
+# 2. Install Mamba dependencies
+pip install causal-conv1d
+pip install mamba-ssm
 
-# 3. Prepare offline BERT weights
+# 3. Prepare datasets
+# Put processed .pkl files under data/
+
+# 4. Prepare offline BERT weights
 # Put bert-base-uncased or bert-base-chinese in the project root
 
-# 4. Train model
+# 5. Train
 python train.py --config_file configs/train_mosi.yaml
 
-# 5. Evaluate robustness
+# 6. Evaluate robustness
 python robust_evaluation.py --config_file configs/eval_mosi.yaml
 ```
 
@@ -484,17 +451,17 @@ python robust_evaluation.py --config_file configs/eval_mosi.yaml
 
 ## 📚 Citation
 
-If you find this project useful for your research, please consider citing our paper:
+If this project is useful for your research, please cite:
 
 ```bibtex
-@article{cmsmamba2024,
+@article{hu_cmsmamba,
   title={CMS-Mamba: A Context-Maintained Surviving Framework for Robust Multimodal Sentiment Analysis under Extreme Missingness},
-  author={Jie Hu and Ming Li},
-  journal={Knowledge-Based Systems},
-  year={2024},
-  note={Under Review}
+  author={Hu, Jie and Li, Ming},
+  note={Under review}
 }
 ```
+
+Please update the BibTeX entry after publication.
 
 ---
 
@@ -506,6 +473,6 @@ This project is released under the MIT License.
 
 ## 🙏 Acknowledgements
 
-This project builds upon the development of multimodal sentiment analysis, State Space Models, Mamba, and robust missing-modality learning.
+This work was supported by the Engineering Research Center of Hubei Province for Clothing Information Program (No. 184084004) and the Hubei Key Laboratory of Digital Textile Equipment Program (No. DTL2018021).
 
-We sincerely thank the creators of the CMU-MOSI, CMU-MOSEI, CH-SIMS datasets and the open-source research community.
+We thank the creators of CMU-MOSI, CMU-MOSEI, CH-SIMS, Mamba, and the open-source multimodal learning community.
