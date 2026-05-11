@@ -7,68 +7,86 @@
 
 Official PyTorch implementation of **CMS-Mamba**, a **Context-Maintained Surviving Mamba** framework for robust multimodal sentiment analysis under extreme modality missingness.
 
-CMS-Mamba targets real-world multimodal affective computing scenarios where text, audio, and visual streams may be partially or completely corrupted due to sensor failure, camera occlusion, packet loss, privacy masking, or unstable edge deployment.
+CMS-Mamba is designed for multimodal affective computing in uncontrolled environments, where text, audio, and visual streams may become unreliable because of token loss, sensor failure, camera occlusion, packet loss, privacy masking, feature extraction failure, or unstable edge deployment.
 
-Instead of relying on reconstruction or simple zero-padding, CMS-Mamba introduces a hierarchical defense system to stabilize Mamba-based multimodal fusion under severe data degradation.
+Instead of reconstructing absent semantics, CMS-Mamba focuses on **survivability**: when multimodal observations degrade into missing or void inputs, the model maintains a stable fallback representation through input-level anchoring, missing-aware state-space control, and final feature-scale stabilization.
 
 ---
 
 ## 🔥 Highlights
 
 - **Extreme Missing-Modality Robustness**  
-  Supports robustness evaluation from missing rate `η = 0.0` to `η = 1.0`, including catastrophic simultaneous text-audio-vision corruption.
+  CMS-Mamba supports robustness evaluation from missing rate `η = 0.0` to `η = 1.0`, including catastrophic simultaneous text-audio-vision missingness.
 
 - **Spatiotemporal Orthogonal Defense**  
-  A hierarchical defense framework consisting of:
+  CMS-Mamba introduces a hierarchical defense system:
   - **LMMT**: Learnable Missing Modality Tokens
   - **DTF**: Dynamic Time-Freezing
   - **RNL**: Representation Normalization Lock
 
-- **State-Space Stability under Missingness**  
-  Addresses zero-value bias, state drift, and feature-magnitude instability in Mamba-based multimodal sentiment analysis.
+- **State-Space Stabilization under Missingness**  
+  CMS-Mamba addresses three major failure modes of Mamba-based multimodal fusion under severe degradation:
+  - zero-value bias
+  - state drift
+  - feature-magnitude instability
 
-- **Text-Aware Long-Sequence Modeling**  
-  Uses CTC-inspired text-aware modality mixing to align long acoustic and visual streams with the text sequence, especially on CMU-MOSEI where sequences can reach 500 frames.
+- **Context-Maintained Survivability**  
+  The model does not hallucinate missing affective semantics. It maintains controlled uncertainty and stable fallback behavior when observations become uninformative.
+
+- **Long-Sequence Multimodal Modeling**  
+  CMS-Mamba supports long unaligned acoustic and visual sequences, including CMU-MOSEI samples with up to 500 frames.
+
+- **Realistic Missingness Evaluation**  
+  In addition to uniform random missingness, CMS-Mamba is evaluated under block missingness, text missingness, audio-visual missingness, text-heavy corruption, audio/vision-heavy corruption, and mixed burst corruption.
 
 - **Edge Deployment Friendly**  
-  Verified on NVIDIA Jetson AGX Orin. CMS-Mamba reduces measured peak CUDA memory footprint and avoids the OOM failure encountered by the reproduced TF-Mamba baseline.
+  CMS-Mamba is validated on NVIDIA Jetson AGX Orin. It reduces measured peak CUDA memory footprint and remains executable at batch size 32, where the reproduced TF-Mamba baseline encounters OOM.
 
 - **Cross-Lingual Dataset Support**  
-  Supports English datasets **CMU-MOSI**, **CMU-MOSEI**, and the Chinese multimodal sentiment dataset **CH-SIMS**.
+  CMS-Mamba supports English datasets **CMU-MOSI**, **CMU-MOSEI**, and the Chinese multimodal sentiment dataset **CH-SIMS**.
 
 ---
 
 ## 🧠 Method Overview
 
+CMS-Mamba treats robust multimodal sentiment analysis as a missing-aware state-space stabilization problem.
+
 ```text
-Input Modalities
- ├── Text
- ├── Audio
- └── Vision
+Text / Audio / Vision Inputs
         │
         ▼
-Spatial Defense
- └── LMMT: Learnable Missing Modality Tokens
+Input-Level Spatial Defense
+        └── LMMT replaces missing acoustic and visual frames
+            with learnable non-zero modality anchors
         │
         ▼
 Text-Aware Modality Mixing
- └── CTC-inspired temporal pseudo-alignment
+        └── Text-guided temporal alignment and modality enhancement
+            for long unaligned audio/visual streams
         │
         ▼
-Temporal Defense
- └── TC-Mamba with Dynamic Time-Freezing
+State-Level Temporal Defense
+        └── TC-Mamba with Dynamic Time-Freezing regulates
+            missing-aware ODE discretization steps
         │
         ▼
 Deep Query Fusion
- └── RoPE-enhanced cross-attention + TQ-Mamba
+        └── RoPE-enhanced cross-attention + TQ-Mamba
+            perform sequence-level multimodal reasoning
         │
         ▼
-Numerical Defense
- └── RNL: Representation Normalization Lock
+Prediction-Level Numerical Defense
+        └── RNL constrains feature-scale drift before regression
         │
         ▼
-Sentiment Prediction
+Sentiment Score Prediction
 ```
+
+The core design principle is **spatial-temporal-numerical defense**:
+
+1. **Spatial defense** prevents missing continuous modalities from collapsing into high-dimensional zero-vector manifolds.
+2. **Temporal defense** prevents Mamba state updates from drifting or integrating uncontrollably under long missing sequences.
+3. **Numerical defense** prevents abnormal feature magnitudes from destabilizing the final sentiment regressor.
 
 ---
 
@@ -76,21 +94,39 @@ Sentiment Prediction
 
 ### LMMT: Learnable Missing Modality Tokens
 
-LMMT replaces zero-padded missing audio and visual frames with trainable modality-specific tokens.
+Conventional missing-modality pipelines often represent missing acoustic and visual frames with zero-padding. For State Space Models, repeated zero-vector inputs may introduce out-of-distribution null patterns and destabilize hidden-state evolution.
 
-This prevents continuous acoustic and visual streams from collapsing into high-dimensional zero vectors. For text, missing non-special tokens are replaced by `[UNK]`, while `[CLS]` and `[SEP]` are preserved to maintain valid BERT sentence boundaries.
+CMS-Mamba introduces **Learnable Missing Modality Tokens (LMMT)** to replace missing audio and visual frames with trainable modality-specific anchors.
+
+For text, missing non-special tokens are replaced by `[UNK]`, while `[CLS]` and `[SEP]` are preserved to maintain valid BERT sentence boundaries.
+
+LMMT provides stable non-zero geometric anchors, helping the model avoid zero-value bias and high-dimensional symmetry collapse.
+
+---
 
 ### DTF: Dynamic Time-Freezing
 
-DTF is embedded into the Mamba state-space engine as a missing-aware step-size controller.
+**Dynamic Time-Freezing (DTF)** is embedded into the TC-Mamba state-space engine as a missing-aware step-size controller.
 
-It regulates the effective discretization step size of the Mamba ODE system. Severely uninformative inputs can drive the state update toward a near-frozen regime, while LMMT-stabilized missing frames can still be integrated through a small and stable positive step.
+DTF regulates the effective discretization step size of the Mamba ODE system. When inputs become severely uninformative, harmful state updates are suppressed. When LMMT anchors are present, the state transition does not collapse into complete shutdown; instead, it enters a controlled positive steady state.
+
+This allows CMS-Mamba to shift from passive suppression to stable structural absorption under catastrophic missingness.
+
+---
 
 ### RNL: Representation Normalization Lock
 
-RNL is applied before the final regression head.
+Long-term processing of low-variance or missing-modality sequences can cause feature-scale drift before the final prediction layer.
 
-It suppresses feature-scale drift and numerical divergence caused by long-term processing of low-variance or missing-modality representations.
+CMS-Mamba applies **Representation Normalization Lock (RNL)** before the final regression head. RNL constrains the magnitude of pooled representations, suppresses numerical divergence, and stabilizes sentiment regression under extreme missingness.
+
+---
+
+### RoPE-Enhanced Deep Query Fusion
+
+Under extreme missingness, modality features may become structurally stable but highly homogeneous. CMS-Mamba applies **Rotary Position Embedding (RoPE)** before cross-attention to preserve deterministic temporal geometry.
+
+The RoPE-enhanced fused sequence is then processed by **TQ-Mamba**, enabling deep sequence-level reasoning before global pooling and final prediction.
 
 ---
 
@@ -156,7 +192,7 @@ pip install causal-conv1d
 pip install mamba-ssm
 ```
 
-> For NVIDIA Jetson AGX Orin, Jetson Orin NX, or other ARM-based CUDA devices, compiling `causal-conv1d` and `mamba-ssm` from source is recommended to avoid binary compatibility issues.
+For NVIDIA Jetson AGX Orin, Jetson Orin NX, or other ARM-based CUDA devices, compiling `causal-conv1d` and `mamba-ssm` from source is recommended to avoid binary compatibility issues.
 
 ---
 
@@ -178,7 +214,7 @@ data/
     └── unaligned_50.pkl
 ```
 
-The datasets used in this project are:
+Datasets used in this project:
 
 - **CMU-MOSI**
 - **CMU-MOSEI**
@@ -296,9 +332,9 @@ At `η = 1.0`:
 - `[CLS]` and `[SEP]` are preserved.
 - Audio frames are converted into zero-padded void vectors before LMMT substitution.
 - Visual frames are converted into zero-padded void vectors before LMMT substitution.
-- CMS-Mamba activates spatial, temporal, and numerical defense mechanisms.
+- CMS-Mamba activates spatial, temporal, and numerical stabilization mechanisms.
 
-CMS-Mamba does not recover missing semantics from absent modalities. Instead, it maintains a stable residual fallback state through learned structural priors, LMMT anchors, and stabilized ODE updates.
+The catastrophic setting `η = 1.0` is a stress test for system stability. CMS-Mamba does **not** claim to recover missing affective semantics when all modalities are absent. Instead, it maintains a stable fallback prior and avoids uncontrolled state evolution, regression explosion, and classification-boundary collapse.
 
 ---
 
@@ -311,7 +347,7 @@ CMS-Mamba does not recover missing semantics from absent modalities. Instead, it
 | CMU-MOSI | 0.7496 | 0.7796 | 83.23 | 82.81 |
 | CMU-MOSEI | 0.5536 | 0.7598 | 85.61 | 85.56 |
 
-> Acc-2 and F1 are reported using the commonly used non-negative / negative-positive setting.
+Acc-2 and F1 are reported using the commonly used negative / non-negative or negative / positive evaluation setting.
 
 ---
 
@@ -339,6 +375,8 @@ Average performance across missing rates `η ∈ [0.0, 0.9]`:
 | CMU-MOSEI | TF-Mamba | 45.53 | **46.89** | 0.6888 |
 | CMU-MOSEI | CMS-Mamba | **45.68** | 46.64 | **0.6653** |
 
+CMS-Mamba achieves the best averaged MOSI metrics and lowers the averaged MOSEI MAE from `0.6888` to `0.6653`.
+
 ---
 
 ## 🧩 Ablation Study
@@ -356,17 +394,62 @@ Ablation results on **CMU-MOSEI**:
 
 Key observations:
 
-- Removing **LMMT** weakens the classification boundary under extreme missingness.
-- Removing **DTF** increases regression error under catastrophic corruption.
-- Removing **RNL** causes feature-scale instability and worsens extreme MAE.
+- Removing **LMMT** weakens the model under catastrophic missingness and causes classification-boundary degradation.
+- Removing **DTF** increases extreme regression error, showing the importance of missing-aware temporal state control.
+- Removing **RNL** may preserve ideal-state metrics but worsens extreme MAE because feature-scale drift is no longer constrained.
 - Adding contrastive loss does not improve robustness in this setting.
 - The full CMS-Mamba achieves the best extreme MAE on CMU-MOSEI.
 
 ---
 
+## 🌪️ Realistic Missingness Evaluation
+
+CMS-Mamba is further evaluated under realistic missingness patterns beyond uniform random masking:
+
+- **Clean**: no missingness
+- **Block 30% / Block 50%**: continuous temporal occlusion
+- **Text Missing**: dominant textual stream is corrupted
+- **A+V Missing**: audio and visual streams are missing while text remains available
+- **Text-heavy**: text is severely corrupted
+- **A/V-heavy**: audio and vision are severely corrupted
+- **Mixed burst**: non-uniform burst-like corruption
+
+CMS-Mamba achieves lower MAE than TF-Mamba in most realistic corruption settings, especially under clean input, block missingness, text missingness, text-heavy corruption, and audio-vision-heavy corruption.
+
+The improvement is particularly clear when the textual stream is corrupted. Under **Text Missing**, CMS-Mamba reduces MAE from `0.9856` to `0.8453` and improves Has0 F1 from approximately `0.4440` to `0.5585`.
+
+Under **Block 30%**, CMS-Mamba reduces MAE from `0.6340` to `0.6281` and improves correlation from `0.6537` to `0.6696`. Under **Block 50%**, it also yields lower MAE and higher correlation.
+
+CMS-Mamba does not uniformly dominate every metric under every missingness pattern. When text remains fully available, such as in deterministic A+V Missing, TF-Mamba may obtain a slightly lower MAE, while CMS-Mamba preserves stronger correlation and classification-boundary metrics. The main advantage of CMS-Mamba lies in improving regression stability and structural robustness under severe, text-corrupted, block-corrupted, or sensor-heavy degradation.
+
+---
+
+## 📐 Statistical Reliability
+
+To evaluate robustness under missing-mask sampling uncertainty, CMS-Mamba and TF-Mamba are tested on CMU-MOSEI using five missing-mask seeds:
+
+```text
+1111, 2222, 3333, 4444, 5555
+```
+
+The trained checkpoints are fixed, and only the test-time missing masks are varied.
+
+CMS-Mamba obtains lower MAE than TF-Mamba in six out of eight realistic missingness settings. In stochastic missingness patterns, the MAE standard deviations of CMS-Mamba remain small, indicating that its robustness does not depend strongly on a particular missing-mask realization.
+
+Notable results include:
+
+- Clean MAE improves from `0.5561` to `0.5477`.
+- Block 30% MAE improves from `0.6340` to `0.6281`.
+- Block 50% MAE improves from `0.6830` to `0.6755`.
+- Text Missing MAE improves from `0.9856` to `0.8453`, corresponding to a relative improvement of `14.23%`.
+
+These results support the claim that CMS-Mamba provides reliable degradation behavior under non-uniform, structured, and asymmetric missing observations.
+
+---
+
 ## 🌏 Cross-Lingual Generalization
 
-Results on the Chinese **CH-SIMS** dataset:
+CMS-Mamba is evaluated on the Chinese **CH-SIMS** dataset to test whether its defense mechanisms generalize beyond English datasets.
 
 | Model | Setting | Acc-2 ↑ | Acc-3 ↑ | F1 ↑ | MAE ↓ |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -375,7 +458,7 @@ Results on the Chinese **CH-SIMS** dataset:
 | TF-Mamba | `η = 1.0` | 60.61 | 26.91 | - | **0.6513** |
 | CMS-Mamba | `η = 1.0` | **66.96** | **30.63** | - | 0.6550 |
 
-CMS-Mamba improves classification robustness on CH-SIMS under both complete and catastrophic missing settings.
+CMS-Mamba improves classification robustness on CH-SIMS under both complete and catastrophic missing settings. The results suggest that zero-value bias, state drift, and feature-scale instability are not dataset-specific artifacts, but general vulnerabilities of multimodal State Space Models under degraded observations.
 
 ---
 
@@ -401,7 +484,7 @@ CUDA: 12.6
 
 CMS-Mamba reduces measured peak CUDA memory footprint by **66.75%** at batch size 16 compared with the reproduced TF-Mamba baseline and remains executable at batch size 32, where the baseline encounters OOM.
 
-> The reported VRAM is the measured peak CUDA memory footprint under the tested Jetson runtime, not parameter memory alone.
+The reported VRAM is the measured peak CUDA memory footprint under the tested Jetson runtime, not parameter memory alone. The reduction should be interpreted as an empirical deployment-level memory advantage under the specified hardware and software setting.
 
 ---
 
@@ -473,6 +556,6 @@ This project is released under the MIT License.
 
 ## 🙏 Acknowledgements
 
-This work was supported by the Engineering Research Center of Hubei Province for Clothing Information Program (No. 184084004) and the Hubei Key Laboratory of Digital Textile Equipment Program (No. DTL2018021).
+This work was supported by the Engineering Research Center of Hubei Province for Clothing Information Program and the Hubei Key Laboratory of Digital Textile Equipment Program.
 
-We thank the creators of CMU-MOSI, CMU-MOSEI, CH-SIMS, Mamba, and the open-source multimodal learning community.
+We thank the creators of CMU-MOSI, CMU-MOSEI, CH-SIMS, Mamba, TF-Mamba, and the open-source multimodal learning community.
