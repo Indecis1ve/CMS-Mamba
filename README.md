@@ -262,10 +262,12 @@ If you find this work useful, please cite:
 
 ## 📄 License
 
-MIT License
+This project is released under the MIT License.
 
 ---
 
 ## 🙏 Acknowledgements
 
-This work builds upon Mamba, TF-Mamba, and the multimodal affective computing community. Supported by relevant Hubei Province programs.
+This work was supported by the Engineering Research Center of Hubei Province for Clothing Information Program and the Hubei Key Laboratory of Digital Textile Equipment Program.
+
+We thank the creators of CMU-MOSI, CMU-MOSEI, CH-SIMS, Mamba, TF-Mamba, and the open-source multimodal learning community.
