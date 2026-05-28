@@ -269,11 +269,3 @@ MIT License
 ## 🙏 Acknowledgements
 
 This work builds upon Mamba, TF-Mamba, and the multimodal affective computing community. Supported by relevant Hubei Province programs.
-
----
-
-**For detailed methodology, proofs, visualizations, and extensive experimental analysis, please read the full paper.**
-
----
-
-**Ready for download and use!** This README has been comprehensively updated to be fully consistent with the paper content while remaining practical and user-friendly.
