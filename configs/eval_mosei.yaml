@@ -2,60 +2,51 @@ base:
   seed: 1111
   batch_size: 64
   num_workers: 8
-  alpha: 0.7
-  train_mode: regression 
+  train_mode: regression
+  missing_pattern: continuous
+  missing_rate_eval_test: [0.0, 0.0, 0.0]
+  block_rate: 0.0
 
 dataset:
   datasetName: mosei
   dataPath: "./data/CMU_MOSEI/Processed/unaligned_50.pkl"
 
-
 model:
-
   com_dim: &com_dim 128
-  dropout: &dropout 0.1
-
+  dropout: &dropout 0.2
   feature_extractor:
-    bert_pretrained: './bert-base-uncased'
-
-  tmm: 
+    bert_pretrained: "./bert-base-uncased"
+  tmm:
     input_length: [50, 500, 500]
     input_dim: [768, 35, 74]
-    hidden_dim: *com_dim 
-  tmr: 
-    input_dim_low: 768
-    hidden_dim_low: 768
-    input_dim_high: *com_dim
-    hidden_dim_high: *com_dim
-    dropout: *dropout
-
+    hidden_dim: *com_dim
   tc_mamba:
-    num_layers: 1
-    d_model: *com_dim 
+    num_layers: 2
+    d_model: *com_dim
     d_ffn: 1024
-    activation: 'GELU'
+    activation: GELU
     dropout: *dropout
     causal: false
+    dtf_threshold: 0.1
     mamba_config:
-      d_state: 12
+      d_state: 16
       expand: 4
       d_conv: 4
       bidirectional: true
   tq_mamba:
-    num_layers: 1
-    d_model: *com_dim 
+    num_layers: 2
+    d_model: *com_dim
     d_ffn: 1024
-    activation: 'GELU'
+    activation: GELU
     dropout: *dropout
     causal: false
+    rope_base: 10000.0
+    attn_heads: 8
     mamba_config:
-      d_state: 12
+      d_state: 16
       expand: 4
       d_conv: 4
       bidirectional: true
-    attn_heads: 8
-
-
-  regression: #task learning
+  regression:
     input_dim: *com_dim
     out_dim: 1
