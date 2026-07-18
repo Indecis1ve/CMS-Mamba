@@ -1,6 +1,13 @@
+"""Robustness evaluation for paper-aligned CMS-Mamba checkpoints.
+
+This entry point only evaluates an existing, architecture-compatible checkpoint.
+It never trains a model or silently accepts parameters from an older architecture.
+"""
+
+import argparse
+from dataclasses import dataclass, field
 import os
 import time
-import argparse
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -8,18 +15,100 @@ import torch
 import yaml
 
 from core.dataset import MMDataEvaluationLoader
-from models.TFMamba import build_model
-from core.metric import MetricsTop
+
 
 try:
     from jtop import jtop  # type: ignore
+
     JTOP_AVAILABLE = True
 except Exception:
     jtop = None
     JTOP_AVAILABLE = False
 
+
 USE_CUDA = torch.cuda.is_available()
 DEVICE = torch.device("cuda" if USE_CUDA else "cpu")
+PATTERNS = (
+    "independent",
+    "continuous",
+    "block",
+    "mixed_burst",
+    "text_missing",
+    "av_missing",
+    "text_heavy",
+    "av_heavy",
+)
+NAMED_PATTERN_RATES = {
+    "text_missing": (1.0, 0.0, 0.0),
+    "av_missing": (0.0, 1.0, 1.0),
+    "text_heavy": (0.7, 0.1, 0.1),
+    "av_heavy": (0.1, 0.7, 0.7),
+}
+
+
+def _validate_rate(name: str, value: float) -> float:
+    value = float(value)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be between 0.0 and 1.0, got {value}")
+    return value
+
+
+def resolve_pattern_rates(
+    pattern: str,
+    missing_rate: float,
+    text_rate: Optional[float] = None,
+    audio_rate: Optional[float] = None,
+    vision_rate: Optional[float] = None,
+) -> tuple[float, float, float]:
+    """Resolve a robustness condition to text/audio/vision missing rates."""
+
+    normalized = str(pattern).lower().replace("-", "_")
+    if normalized not in PATTERNS:
+        raise ValueError(f"unsupported missingness pattern: {pattern}")
+    base_rates = NAMED_PATTERN_RATES.get(
+        normalized,
+        (_validate_rate("missing_rate", missing_rate),) * 3,
+    )
+    overrides = (text_rate, audio_rate, vision_rate)
+    names = ("text_rate", "audio_rate", "vision_rate")
+    return tuple(
+        base if override is None else _validate_rate(name, override)
+        for base, override, name in zip(base_rates, overrides, names)
+    )
+
+
+def dataset_pattern(pattern: str) -> str:
+    normalized = str(pattern).lower().replace("-", "_")
+    return "independent" if normalized in NAMED_PATTERN_RATES else normalized
+
+
+@dataclass
+class MissingRateTracker:
+    missing: Dict[str, float] = field(
+        default_factory=lambda: {"text": 0.0, "audio": 0.0, "vision": 0.0}
+    )
+    eligible: Dict[str, float] = field(
+        default_factory=lambda: {"text": 0.0, "audio": 0.0, "vision": 0.0}
+    )
+
+    def update(self, batch_data: Dict[str, Any]):
+        for modality in self.missing:
+            missing = batch_data[f"{modality}_missing_mask"].to(dtype=torch.bool)
+            valid = batch_data[f"{modality}_valid_mask"].to(dtype=torch.bool)
+            if torch.any(missing & ~valid):
+                raise RuntimeError(f"{modality} missing mask includes padding")
+            self.missing[modality] += float((missing & valid).sum())
+            self.eligible[modality] += float(valid.sum())
+
+    def rates(self) -> Dict[str, float]:
+        return {
+            modality: (
+                self.missing[modality] / self.eligible[modality]
+                if self.eligible[modality]
+                else 0.0
+            )
+            for modality in self.missing
+        }
 
 
 class PerformanceTracker:
@@ -27,13 +116,12 @@ class PerformanceTracker:
         self.latency_list: List[float] = []
         self.gpu_pwr_list: List[float] = []
         self.temp_list: List[float] = []
-        self.mem_allocated_max: int = 0
+        self.mem_allocated_max = 0
 
     def update_memory(self):
         if USE_CUDA:
             self.mem_allocated_max = max(
-                self.mem_allocated_max,
-                torch.cuda.max_memory_allocated()
+                self.mem_allocated_max, torch.cuda.max_memory_allocated()
             )
 
     def update_jetson(self, jetson_obj: Any):
@@ -45,272 +133,245 @@ class PerformanceTracker:
             power = jetson_obj.power
             if isinstance(power, dict) and "tot" in power and "avg" in power["tot"]:
                 self.gpu_pwr_list.append(float(power["tot"]["avg"]) / 1000.0)
-            temp_data = jetson_obj.temperature
-            if isinstance(temp_data, dict):
-                if "tj" in temp_data and isinstance(temp_data["tj"], dict):
-                    self.temp_list.append(float(temp_data["tj"].get("temp", 0.0)))
-                elif "cpu" in temp_data and isinstance(temp_data["cpu"], dict):
-                    self.temp_list.append(float(temp_data["cpu"].get("temp", 0.0)))
+            temperature = jetson_obj.temperature
+            if isinstance(temperature, dict):
+                for key in ("tj", "cpu"):
+                    if key in temperature and isinstance(temperature[key], dict):
+                        self.temp_list.append(
+                            float(temperature[key].get("temp", 0.0))
+                        )
+                        break
         except Exception:
             pass
 
     def report(
         self,
         batch_size: int,
-        final_metrics: Dict[str, float],
-        missing_rate: float,
-        eval_missing_modalities: str,
-        missing_policy: str,
-        ckpt_path: str,
+        metrics: Dict[str, float],
+        pattern: str,
+        requested_rates: tuple[float, float, float],
+        realized_rates: Dict[str, float],
+        checkpoint_path: str,
     ):
-        avg_latency_ms = float(np.mean(self.latency_list) * 1000.0) if self.latency_list else 0.0
-        throughput = float(batch_size / (avg_latency_ms / 1000.0)) if avg_latency_ms > 0 else 0.0
-        avg_power = float(np.mean(self.gpu_pwr_list)) if self.gpu_pwr_list else -1.0
-        avg_temp = float(np.mean(self.temp_list)) if self.temp_list else -1.0
+        latency_ms = (
+            float(np.mean(self.latency_list) * 1000.0)
+            if self.latency_list
+            else 0.0
+        )
+        throughput = batch_size / (latency_ms / 1000.0) if latency_ms else 0.0
+        average_power = (
+            float(np.mean(self.gpu_pwr_list)) if self.gpu_pwr_list else None
+        )
+        average_temperature = (
+            float(np.mean(self.temp_list)) if self.temp_list else None
+        )
 
-        print("\n" + "=" * 78)
-        print("🛡️  CMS-Mamba 极限生存评估报告")
-        print("-" * 78)
-        print(f"📦 Checkpoint             : {ckpt_path}")
-        print(f"🎯 Missing Rate           : {missing_rate:.1f}")
-        print(f"🎯 Missing Modalities     : {eval_missing_modalities}")
-        print(f"🧊 Missing Policy         : {missing_policy}")
-        print(f"📊 Batch Size             : {batch_size}")
-        print("-" * 78)
-        print("【边缘/推理性能】")
-        print(f"⏱️  平均 Batch 推理延迟     : {avg_latency_ms:.2f} ms")
-        print(f"🚀 估算吞吐量              : {throughput:.2f} samples/s")
-        print(f"💾 CUDA 显存峰值           : {self.mem_allocated_max / 1024 ** 2:.2f} MB")
-        print(f"⚡ 平均运行功耗            : {avg_power:.2f} W" if avg_power >= 0 else "⚡ 平均运行功耗            : N/A")
-        print(f"🔥 平均核心温度            : {avg_temp:.2f} °C" if avg_temp >= 0 else "🔥 平均核心温度            : N/A")
-        print("-" * 78)
-        print("【鲁棒性指标】")
-        for k, v in final_metrics.items():
-            print(f"✨ {k:<16}: {v:.4f}")
-        print("=" * 78 + "\n")
+        print("\n" + "=" * 72)
+        print("CMS-Mamba 鲁棒性评估报告")
+        print(f"Checkpoint: {checkpoint_path}")
+        print(f"Pattern: {pattern}")
+        print(
+            "Requested missing rates (T/A/V): "
+            + "/".join(f"{rate:.3f}" for rate in requested_rates)
+        )
+        print(
+            "Realized missing rates (T/A/V): "
+            + "/".join(
+                f"{realized_rates[name]:.3f}"
+                for name in ("text", "audio", "vision")
+            )
+        )
+        print(f"Average batch latency: {latency_ms:.2f} ms")
+        print(f"Estimated throughput: {throughput:.2f} samples/s")
+        print(f"Peak CUDA memory: {self.mem_allocated_max / 1024 ** 2:.2f} MB")
+        print(
+            f"Average power: {average_power:.2f} W"
+            if average_power is not None
+            else "Average power: N/A"
+        )
+        print(
+            f"Average temperature: {average_temperature:.2f} C"
+            if average_temperature is not None
+            else "Average temperature: N/A"
+        )
+        for name, value in metrics.items():
+            print(f"{name}: {float(value):.4f}")
+        print("=" * 72 + "\n")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="CMS-Mamba robust evaluation for one missing rate.")
-    parser.add_argument("--config_file", type=str, default="configs/eval_mosei.yaml")
-    parser.add_argument("--ckpt_path", type=str, default="ckpt/mosei/best_MAE_1111.pth")
-    parser.add_argument("--missing_rate", type=float, default=1.0)
-    parser.add_argument(
-        "--eval_missing_modalities",
-        type=str,
-        default="TAV",
-        choices=["T", "A", "V", "TA", "TV", "AV", "TAV"],
-        help="Which modalities are corrupted during evaluation.",
+    parser = argparse.ArgumentParser(
+        description="Evaluate one paper-defined CMS-Mamba missingness condition."
     )
+    parser.add_argument("--config_file", default="configs/eval_mosei.yaml")
     parser.add_argument(
-        "--missing_policy",
-        type=str,
-        default="zero",
-        choices=["zero", "model"],
-        help="zero = clear learned missing tokens; model = keep learned missing tokens.",
+        "--ckpt_path", default="ckpt/mosei/best_validation_MAE_1111.pth"
     )
-    parser.add_argument("--strict_mask_check", action="store_true")
-    parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--pattern", choices=PATTERNS, default="continuous")
+    parser.add_argument("--missing_rate", type=float, default=0.5)
+    parser.add_argument("--text_rate", type=float)
+    parser.add_argument("--audio_rate", type=float)
+    parser.add_argument("--vision_rate", type=float)
+    parser.add_argument("--block_rate", type=float, default=0.0)
+    parser.add_argument("--mask_seed", type=int, default=1111)
+    parser.add_argument("--num_workers", type=int)
     parser.add_argument("--disable_jtop", action="store_true")
     parser.add_argument("--disable_amp", action="store_true")
     return parser.parse_args()
 
 
-def load_config(config_file: str, missing_rate: float, eval_missing_modalities: str, num_workers: Optional[int]):
-    with open(config_file, "r", encoding="utf-8") as f:
-        args = yaml.load(f, Loader=yaml.FullLoader)
-        
+def load_config(
+    config_file: str,
+    pattern: str,
+    rates: tuple[float, float, float],
+    block_rate: float,
+    mask_seed: int,
+    num_workers: Optional[int],
+):
+    with open(config_file, encoding="utf-8") as handle:
+        args = yaml.safe_load(handle)
     args.setdefault("base", {})
-    args.setdefault("dataset", {})
-    
-    # 全局覆盖所有可能的 missing_rate 字段，防止 Dataloader 读错
-    args["base"]["missing_rate_eval_test"] = float(missing_rate)
-    args["base"]["missing_rate"] = float(missing_rate)
-    args["dataset"]["missing_rate"] = float(missing_rate)
-    
-    args["base"]["eval_missing_modalities"] = eval_missing_modalities
-    
+    args["base"]["missing_pattern"] = dataset_pattern(pattern)
+    args["base"]["missing_rate_eval_test"] = list(rates)
+    args["base"]["block_rate"] = _validate_rate("block_rate", block_rate)
+    args["base"]["seed"] = int(mask_seed)
     if num_workers is not None:
         args["base"]["num_workers"] = int(num_workers)
-        
     return args
 
 
-def normalize_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith("module."):
-            new_state_dict[k[7:]] = v
-        elif k.startswith("model."):
-            new_state_dict[k[6:]] = v
-        else:
-            new_state_dict[k] = v
-    return new_state_dict
+def normalize_state_dict(state_dict: Dict[str, torch.Tensor]):
+    normalized = {}
+    for name, value in state_dict.items():
+        if name.startswith("module."):
+            name = name[7:]
+        elif name.startswith("model."):
+            name = name[6:]
+        normalized[name] = value
+    return normalized
 
 
-def load_checkpoint(model: torch.nn.Module, ckpt_path: str):
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"❌ 找不到权重文件: {ckpt_path}")
-    print(f"📦 正在加载权重: {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location=DEVICE)
+def load_checkpoint(model: torch.nn.Module, checkpoint_path: str, device=DEVICE):
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
     elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
         state_dict = checkpoint["state_dict"]
     else:
         state_dict = checkpoint
-    load_info = model.load_state_dict(normalize_state_dict(state_dict), strict=False)
-    print(f"⚠️ [诊断信息] Missing Keys 数量: {len(load_info.missing_keys)}")
-    if load_info.missing_keys:
-        print(f"🚨 Missing Keys 前 10 个: {load_info.missing_keys[:10]}")
-    print(f"⚠️ [诊断信息] Unexpected Keys 数量: {len(load_info.unexpected_keys)}")
-    if load_info.unexpected_keys:
-        print(f"🚨 Unexpected Keys 前 10 个: {load_info.unexpected_keys[:10]}")
-    if not load_info.missing_keys and not load_info.unexpected_keys:
-        print("✅ 权重加载完成：没有缺失或多余参数。")
+    try:
+        model.load_state_dict(normalize_state_dict(state_dict), strict=True)
+    except RuntimeError as error:
+        raise RuntimeError(
+            "checkpoint is incompatible with the paper-aligned architecture; "
+            "retraining is required before evaluation"
+        ) from error
 
 
-def apply_missing_policy(model: torch.nn.Module, missing_policy: str):
-    if missing_policy == "model":
-        print("[missing-policy] model: 保留 checkpoint 中的 learned missing token。")
-        return
-    if missing_policy == "zero":
-        changed = []
-        with torch.no_grad():
-            if hasattr(model, "v_mask_token"):
-                model.v_mask_token.zero_()
-                changed.append("v_mask_token")
-            if hasattr(model, "a_mask_token"):
-                model.a_mask_token.zero_()
-                changed.append("a_mask_token")
-        print(f"[missing-policy] zero: 已将 {changed} 置零。")
-        return
-    raise ValueError(f"Unknown missing_policy: {missing_policy}")
-
-
-def check_first_batch_mask(batch_data: Dict[str, Any], missing_rate: float, eval_missing_modalities: str, strict: bool):
-    messages = []
-    mask_keys = {"T": "text_missing_mask", "A": "audio_missing_mask", "V": "vision_missing_mask"}
-    orig_keys = {"T": "text_mask", "A": "audio_mask", "V": "vision_mask"}
-    
-    for modality, key in mask_keys.items():
-        if key not in batch_data:
-            continue
-        
-        missing_mask = batch_data[key]
-        orig_mask = batch_data[orig_keys[modality]]
-        
-        # 计算真实的有效 token 数量（剔除 Padding）
-        valid_count = float(orig_mask.sum().item())
-        if valid_count > 0:
-            keep_count = float(missing_mask.sum().item())
-            keep_ratio = keep_count / valid_count
-        else:
-            keep_ratio = 1.0
-            
-        missing_ratio = 1.0 - keep_ratio
-        messages.append(f"{modality}: missing={missing_ratio:.4f}, keep={keep_ratio:.4f}")
-        
-        target = float(missing_rate) if modality in eval_missing_modalities else 0.0
-        # 文本模态默认保留 CLS 和 SEP，所以 1.0 缺失率时允许一定误差
-        tolerance = 0.12 if modality == "T" else 0.08
-        
-        if strict and abs(missing_ratio - target) > tolerance:
-            raise RuntimeError(
-                f"[strict-mask-check] {modality} missing ratio mismatch: "
-                f"target={target:.4f}, actual={missing_ratio:.4f}, "
-                f"eval_missing_modalities={eval_missing_modalities}"
-            )
-            
-    print(
-        f"[mask-check] target_r={missing_rate:.1f}, "
-        f"eval_missing_modalities={eval_missing_modalities}, "
-        + ", ".join(messages)
+def model_forward(model, batch_data, disable_amp: bool):
+    incomplete_input = (
+        batch_data["vision_m"].to(DEVICE),
+        batch_data["audio_m"].to(DEVICE),
+        batch_data["text_m"].to(DEVICE),
     )
-
-
-def model_forward(model: torch.nn.Module, batch_data: Dict[str, Any], disable_amp: bool):
-    v_m = batch_data["vision_m"].to(DEVICE)
-    a_m = batch_data["audio_m"].to(DEVICE)
-    t_m = batch_data["text_m"].to(DEVICE)
+    missing_masks = (
+        batch_data["text_missing_mask"].to(DEVICE),
+        batch_data["audio_missing_mask"].to(DEVICE),
+        batch_data["vision_missing_mask"].to(DEVICE),
+    )
+    valid_masks = (
+        batch_data["text_valid_mask"].to(DEVICE),
+        batch_data["audio_valid_mask"].to(DEVICE),
+        batch_data["vision_valid_mask"].to(DEVICE),
+    )
     if USE_CUDA and not disable_amp:
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            return model((None, None, None), (v_m, a_m, t_m))
-    return model((None, None, None), (v_m, a_m, t_m))
+            return model(incomplete_input, missing_masks, valid_masks)
+    return model(incomplete_input, missing_masks, valid_masks)
 
 
-def evaluate_one_missing_rate():
-    opt = parse_args()
-    print(f"Using device: {DEVICE}")
-    print(opt)
-    if opt.missing_rate < 0.0 or opt.missing_rate > 1.0:
-        raise ValueError("--missing_rate must be between 0.0 and 1.0")
+def evaluate_one_condition():
+    options = parse_args()
+    rates = resolve_pattern_rates(
+        options.pattern,
+        options.missing_rate,
+        options.text_rate,
+        options.audio_rate,
+        options.vision_rate,
+    )
+    args = load_config(
+        options.config_file,
+        options.pattern,
+        rates,
+        options.block_rate,
+        options.mask_seed,
+        options.num_workers,
+    )
 
-    args = load_config(opt.config_file, opt.missing_rate, opt.eval_missing_modalities, opt.num_workers)
-    print(args)
-    print(f"⚠️ 当前缺失率测试: {opt.missing_rate:.1f}")
-    print(f"🎯 缺失模态: {opt.eval_missing_modalities}")
-    print(f"🧊 缺失策略: {opt.missing_policy}")
-
-    dataset_name = args["dataset"]["datasetName"]
-    batch_size = int(args["base"]["batch_size"])
+    # Lazy import keeps protocol/config checks usable without model dependencies.
+    from core.metric import MetricsTop
+    from models.TFMamba import build_model
 
     model = build_model(args).to(DEVICE)
-    load_checkpoint(model, opt.ckpt_path)
-    apply_missing_policy(model, opt.missing_policy)
+    load_checkpoint(model, options.ckpt_path)
     model.eval()
 
-    metrics_handler = MetricsTop(train_mode=args["base"]["train_mode"]).getMetics(dataset_name)
-    data_loader = MMDataEvaluationLoader(args)
+    dataset_name = args["dataset"]["datasetName"]
+    metrics = MetricsTop(args["base"]["train_mode"]).getMetics(dataset_name)
+    data_loader = MMDataEvaluationLoader(args, mode="test")
+    performance = PerformanceTracker()
+    missingness = MissingRateTracker()
+    predictions, labels = [], []
 
-    tracker = PerformanceTracker()
-    all_preds = []
-    all_labels = []
-
-    use_jtop = JTOP_AVAILABLE and not opt.disable_jtop
-    print("✅ jtop 可用：将记录 Jetson 功耗与温度。" if use_jtop else "ℹ️ jtop 不可用或已禁用：仅记录延迟、吞吐量与显存。")
+    use_jtop = JTOP_AVAILABLE and not options.disable_jtop
     jetson_context = jtop() if use_jtop else None
 
     def run_loop(jetson_obj=None):
         with torch.no_grad():
-            for i, batch_data in enumerate(data_loader):
-                if i == 0:
-                    check_first_batch_mask(batch_data, opt.missing_rate, opt.eval_missing_modalities, opt.strict_mask_check)
-                labels = batch_data["labels"]["M"].to(DEVICE)
+            for batch_index, batch_data in enumerate(data_loader):
+                missingness.update(batch_data)
+                target = batch_data["labels"]["M"].to(DEVICE)
                 if USE_CUDA:
                     torch.cuda.reset_peak_memory_stats()
                     start_event = torch.cuda.Event(enable_timing=True)
                     end_event = torch.cuda.Event(enable_timing=True)
                     start_event.record()
-                    out = model_forward(model, batch_data, opt.disable_amp)
+                    output = model_forward(model, batch_data, options.disable_amp)
                     end_event.record()
                     torch.cuda.synchronize()
-                    latency_s = start_event.elapsed_time(end_event) / 1000.0
+                    elapsed = start_event.elapsed_time(end_event) / 1000.0
                 else:
                     start = time.perf_counter()
-                    out = model_forward(model, batch_data, opt.disable_amp)
-                    latency_s = time.perf_counter() - start
+                    output = model_forward(model, batch_data, options.disable_amp)
+                    elapsed = time.perf_counter() - start
+                performance.latency_list.append(elapsed)
+                performance.update_memory()
+                performance.update_jetson(jetson_obj)
+                predictions.append(output["sentiment_preds"].float().cpu())
+                labels.append(target.float().cpu())
+                if (batch_index + 1) % 10 == 0:
+                    print(f"Processed {batch_index + 1} batches")
 
-                tracker.latency_list.append(latency_s)
-                tracker.update_memory()
-                tracker.update_jetson(jetson_obj)
-                all_preds.append(out["sentiment_preds"].float().cpu())
-                all_labels.append(labels.float().cpu())
-
-                if (i + 1) % 10 == 0:
-                    print(f"进度: 已处理 {i + 1} 个 Batch...")
-
-    if jetson_context is not None:
+    if jetson_context is None:
+        run_loop()
+    else:
         with jetson_context as jetson:
             run_loop(jetson)
-    else:
-        run_loop(None)
 
-    final_preds = torch.cat(all_preds, dim=0)
-    final_labels = torch.cat(all_labels, dim=0)
-    results = metrics_handler(final_preds, final_labels)
-    tracker.report(batch_size, results, opt.missing_rate, opt.eval_missing_modalities, opt.missing_policy, opt.ckpt_path)
+    if not predictions:
+        raise RuntimeError("test loader produced no batches")
+    results = metrics(torch.cat(predictions), torch.cat(labels))
+    performance.report(
+        int(args["base"]["batch_size"]),
+        results,
+        options.pattern,
+        rates,
+        missingness.rates(),
+        options.ckpt_path,
+    )
 
 
 if __name__ == "__main__":
-    evaluate_one_missing_rate()
+    evaluate_one_condition()
