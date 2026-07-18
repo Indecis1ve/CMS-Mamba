@@ -1,249 +1,220 @@
-import warnings
-from dataclasses import dataclass
-from typing import List, Optional
+"""TC-Mamba, TQ-Mamba, and paper-aligned cross-modal fusion wrappers."""
 
-import abc
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-#
-from models.mamba_nets.attention import Attention
-# Mamba
-from mamba_ssm import Mamba
+from torch import nn
+
+from mamba_ssm import Mamba as UniMamba
+
+from models.mamba_nets.attention import RotaryKeyCrossAttention
 from models.mamba_nets.bimamba import Mamba as BiMamba
 from models.mamba_nets.mm_bimamba import Mamba as MMBiMamba
 
 
 class MMMambaEncoderLayer(nn.Module):
+    """A two-stream TC layer controlled by one branch missingness indicator."""
+
     def __init__(
-            self,
-            d_model,
-            d_ffn,
-            activation='Swish',
-            dropout=0.1,
-            causal=False,
-            mamba_config=None
+        self,
+        d_model,
+        d_ffn,
+        activation="Swish",
+        dropout=0.1,
+        causal=False,
+        mamba_config=None,
     ):
         super().__init__()
-        assert mamba_config != None
-
-        # if activation == 'Swish':
-        #     activation = Swish
-        # elif activation == "GELU":
-        #     activation = torch.nn.GELU
-        # else:
-        #     activation = Swish
-
-        bidirectional = mamba_config.pop('bidirectional')
-
-        if causal or (not bidirectional):
-            self.mamba = Mamba(
-                d_model=d_model,
-                **mamba_config
+        del d_ffn, activation, dropout
+        if mamba_config is None:
+            raise ValueError("TC-Mamba requires a mamba_config")
+        config = dict(mamba_config)
+        bidirectional = bool(config.pop("bidirectional", True))
+        if causal or not bidirectional:
+            raise ValueError(
+                "paper-aligned TC-Mamba requires bidirectional selective scans"
             )
-        else:
-            self.mamba = MMBiMamba(
-                d_model=d_model,
-                bimamba_type='v2',
-                **mamba_config
-            )
-
-        mamba_config['bidirectional'] = bidirectional
-
-        self.norm1 = nn.LayerNorm(d_model, eps=1e-6)
-        self.norm2 = nn.LayerNorm(d_model, eps=1e-6)
-        self.drop = nn.Dropout(dropout)
+        self.mamba = MMBiMamba(
+            d_model=d_model,
+            bimamba_type="v2",
+            **config,
+        )
+        self.left_norm = nn.LayerNorm(d_model, eps=1e-6)
+        self.right_norm = nn.LayerNorm(d_model, eps=1e-6)
 
     def forward(
-            self,
-            a_x, v_x,
-            a_inference_params=None,
-            v_inference_params=None
+        self,
+        left,
+        right,
+        missing_indicator,
+        left_inference_params=None,
+        right_inference_params=None,
     ):
-
-        a_out1, v_out1 = self.mamba(a_x, v_x, a_inference_params, v_inference_params)
-        a_out = a_x + self.norm1(a_out1)
-        v_out = v_x + self.norm2(v_out1)
-
-        return a_out, v_out
+        left_delta, right_delta = self.mamba(
+            left,
+            right,
+            missing_indicator,
+            left_inference_params,
+            right_inference_params,
+        )
+        return (
+            left + self.left_norm(left_delta),
+            right + self.right_norm(right_delta),
+        )
 
 
 class MambaEncoderLayer(nn.Module):
     def __init__(
-            self,
-            d_model,
-            d_ffn,
-            activation='Swish',
-            dropout=0.1,
-            causal=False,
-            mamba_config=None
+        self,
+        d_model,
+        d_ffn,
+        activation="Swish",
+        dropout=0.1,
+        causal=False,
+        mamba_config=None,
     ):
         super().__init__()
-        assert mamba_config != None
-
-        # if activation == 'Swish':
-        #     activation = Swish
-        # elif activation == "GELU":
-        #     activation = torch.nn.GELU
-        # else:
-        #     activation = Swish
-
-        bidirectional = mamba_config.pop('bidirectional')
-        if causal or (not bidirectional):
-            self.mamba = Mamba(
-                d_model=d_model,
-                **mamba_config
-            )
+        del d_ffn, activation, dropout
+        if mamba_config is None:
+            raise ValueError("TQ-Mamba requires a mamba_config")
+        config = dict(mamba_config)
+        bidirectional = bool(config.pop("bidirectional", True))
+        if causal or not bidirectional:
+            self.mamba = UniMamba(d_model=d_model, **config)
         else:
             self.mamba = BiMamba(
                 d_model=d_model,
-                bimamba_type='v2',
-                **mamba_config
+                bimamba_type="v2",
+                **config,
             )
-        mamba_config['bidirectional'] = bidirectional
+        self.norm = nn.LayerNorm(d_model, eps=1e-6)
 
-        self.norm1 = nn.LayerNorm(d_model, eps=1e-6)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(
-            self,
-            x, inference_params=None
-    ):
-        out = x + self.norm1(self.mamba(x, inference_params))
-        return out
+    def forward(self, x, inference_params=None):
+        return x + self.norm(self.mamba(x, inference_params))
 
 
 class TCMamba(nn.Module):
-
+    """Parallel AT and VT branches that retain separate text contexts."""
 
     def __init__(
-            self,
-            num_layers,
-            d_model,
-            d_ffn=1024,
-            activation='Swish',
-            dropout=0.1,
-            causal=False,
-            mamba_config=None
+        self,
+        num_layers,
+        d_model,
+        d_ffn=1024,
+        activation="Swish",
+        dropout=0.1,
+        causal=False,
+        mamba_config=None,
     ):
         super().__init__()
-        print(f'dropout={str(dropout)} is not used in Mamba.')
-        at_mamba_list = []
-        vt_mamba_list = []
-        # print(output_sizes)
-        for i in range(num_layers):
-            at_mamba_list.append(MMMambaEncoderLayer(
-                d_model=d_model,
-                d_ffn=d_ffn,
-                dropout=dropout,
-                activation=activation,
-                causal=causal,
-                mamba_config=mamba_config,
-            ))
-            vt_mamba_list.append(MMMambaEncoderLayer(
-                d_model=d_model,
-                d_ffn=d_ffn,
-                dropout=dropout,
-                activation=activation,
-                causal=causal,
-                mamba_config=mamba_config,
-            ))
-
-        self.at_mamba_layers = torch.nn.ModuleList(at_mamba_list)
-        self.vt_mamba_layers = torch.nn.ModuleList(vt_mamba_list)
-
+        layer_arguments = {
+            "d_model": d_model,
+            "d_ffn": d_ffn,
+            "dropout": dropout,
+            "activation": activation,
+            "causal": causal,
+            "mamba_config": mamba_config,
+        }
+        self.at_mamba_layers = nn.ModuleList(
+            MMMambaEncoderLayer(**layer_arguments) for _ in range(num_layers)
+        )
+        self.vt_mamba_layers = nn.ModuleList(
+            MMMambaEncoderLayer(**layer_arguments) for _ in range(num_layers)
+        )
 
     def forward(
-            self,
-            a_x, v_x, t_x,
-            a_inference_params=None,
-            v_inference_params=None,
-            t_inference_params=None
+        self,
+        audio,
+        vision,
+        text,
+        text_missing,
+        audio_missing,
+        vision_missing,
+        audio_inference_params=None,
+        vision_inference_params=None,
+        text_inference_params=None,
     ):
-        a_out = a_x
-        v_out = v_x
-        t_out = t_x
+        if not (
+            text_missing.shape
+            == audio_missing.shape
+            == vision_missing.shape
+            == text.shape[:2]
+        ):
+            raise ValueError("TC-Mamba aligned missing masks must match text time")
+        audio_out = audio
+        vision_out = vision
+        text_at = text
+        text_vt = text
+        at_indicator = torch.stack((text_missing, audio_missing), dim=-1)
+        vt_indicator = torch.stack((text_missing, vision_missing), dim=-1)
 
-        for at_mamba_layer, vt_mamba_layer in zip(self.at_mamba_layers, self.vt_mamba_layers):
-            a_out, t_out_at = at_mamba_layer(
-                a_out, t_out,
-                a_inference_params,
-                t_inference_params
+        for at_layer, vt_layer in zip(
+            self.at_mamba_layers,
+            self.vt_mamba_layers,
+        ):
+            audio_out, text_at = at_layer(
+                audio_out,
+                text_at,
+                at_indicator,
+                audio_inference_params,
+                text_inference_params,
             )
-            v_out, t_out_vt = vt_mamba_layer(
-                v_out, t_out,
-                v_inference_params,
-                t_inference_params
+            vision_out, text_vt = vt_layer(
+                vision_out,
+                text_vt,
+                vt_indicator,
+                vision_inference_params,
+                text_inference_params,
             )
-            t_out = (t_out_at+t_out_vt)/2
-
-        return a_out, v_out,t_out
+        return audio_out, vision_out, text_at, text_vt
 
 
 class TQMamba(nn.Module):
-
     def __init__(
-            self,
-            num_layers,
-            d_model,
-            d_ffn=1024,
-            activation='Swish',
-            dropout=0.1,
-            causal=False,
-            mamba_config=None
+        self,
+        num_layers,
+        d_model,
+        d_ffn=1024,
+        activation="Swish",
+        dropout=0.1,
+        causal=False,
+        mamba_config=None,
     ):
         super().__init__()
-        print(f'dropout={str(dropout)} is not used in Mamba.')
-
-        mamba_list = []
-        # print(output_sizes)
-        for i in range(num_layers):
-
-            mamba_list.append(MambaEncoderLayer(
+        self.mamba_layers = nn.ModuleList(
+            MambaEncoderLayer(
                 d_model=d_model,
                 d_ffn=d_ffn,
                 dropout=dropout,
                 activation=activation,
                 causal=causal,
                 mamba_config=mamba_config,
-            ))
-
-        self.mamba_layers = torch.nn.ModuleList(mamba_list)
-
-    def forward(
-            self,
-            x,
-            inference_params=None,
-    ):
-        out = x
-
-        for mamba_layer in  self.mamba_layers:
-            out = mamba_layer(
-                out,
-                inference_params=inference_params,
             )
+            for _ in range(num_layers)
+        )
 
-        return out
+    def forward(self, x, inference_params=None):
+        output = x
+        for layer in self.mamba_layers:
+            output = layer(output, inference_params=inference_params)
+        return output
+
 
 class Crossattn(nn.Module):
-
-
     def __init__(
-            self,
-            num_heads,
-            d_model,
+        self,
+        num_heads,
+        d_model,
+        modal_dim=None,
+        dropout=0.0,
+        rope_base=10000.0,
     ):
         super().__init__()
-        self.cross_attention = Attention(dim=d_model,heads=num_heads)
-        self.norm = nn.LayerNorm(d_model, eps=1e-6)
-        # print(output_sizes)
+        self.cross_attention = RotaryKeyCrossAttention(
+            query_dim=d_model,
+            modal_dim=2 * d_model if modal_dim is None else modal_dim,
+            heads=num_heads,
+            dropout=dropout,
+            rope_base=rope_base,
+        )
 
-
-    def forward(
-            self,
-            x_q, x_kv
-    ):
-        out_attn = self.cross_attention(x_q,x_kv,x_kv)
-        out =  x_q + self.norm(out_attn)
-
-        return out
+    def forward(self, text_query, modal_key_value):
+        return self.cross_attention(text_query, modal_key_value)

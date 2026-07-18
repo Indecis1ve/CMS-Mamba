@@ -1,112 +1,133 @@
+"""Paper-aligned CMS-Mamba model."""
+
 import torch
 from torch import nn
+
 from models.bert import BertTextEncoder
-from einops import rearrange, repeat
+from models.mamba import Crossattn, TCMamba, TQMamba
+from models.missingness import apply_missing_token
 from models.tmm import EnhanceSubNet
-from models.mamba import TCMamba, TQMamba, Crossattn
 
-class TFMamba(nn.Module):
+
+class CMSMamba(nn.Module):
     def __init__(self, args):
-        super(TFMamba, self).__init__()
+        super().__init__()
+        model_args = args["model"]
+        self.bertmodel = BertTextEncoder(
+            use_finetune=True,
+            transformers="bert",
+            pretrained=model_args["feature_extractor"]["bert_pretrained"],
+        )
 
-        self.bertmodel = BertTextEncoder(use_finetune=True, transformers='bert', pretrained=args['model']['feature_extractor']['bert_pretrained'])
+        vision_dim = int(model_args["tmm"]["input_dim"][1])
+        audio_dim = int(model_args["tmm"]["input_dim"][2])
+        self.v_mask_token = nn.Parameter(torch.empty(1, 1, vision_dim))
+        self.a_mask_token = nn.Parameter(torch.empty(1, 1, audio_dim))
+        nn.init.normal_(self.v_mask_token, mean=0.0, std=0.02)
+        nn.init.normal_(self.a_mask_token, mean=0.0, std=0.02)
 
-        # ==========================================================
-        # Learnable Missing Modality Tokens (LMMT)
-        vision_dim = args['model']['tmm']['input_dim'][1] # 默认 20
-        audio_dim = args['model']['tmm']['input_dim'][2]  # 默认 5
-        
-        self.v_mask_token = nn.Parameter(torch.randn(1, 1, vision_dim) * 0.02)
-        self.a_mask_token = nn.Parameter(torch.randn(1, 1, audio_dim) * 0.02)
-        # ==========================================================
-
-        # TME
         self.text_modality_mixup = EnhanceSubNet(
-            input_length=args['model']['tmm']['input_length'],
-            input_dim=args['model']['tmm']['input_dim'],
-            hidden_dim=args['model']['tmm']['hidden_dim']
+            input_length=model_args["tmm"]["input_length"],
+            input_dim=model_args["tmm"]["input_dim"],
+            hidden_dim=model_args["tmm"]["hidden_dim"],
         )
-        
-        # feature reconstruction
-        self.recon_text_low = nn.Sequential(
-            nn.Linear(args['model']['tmr']['input_dim_high'], args['model']['tmr']['input_dim_high']),
-            nn.ReLU(),
-            nn.Dropout(args['model']['tmr']['dropout']),
-            nn.Linear(args['model']['tmr']['input_dim_high'], args['model']['tmr']['input_dim_low'])
+
+        tc_args = model_args["tc_mamba"]
+        tc_mamba_config = dict(tc_args["mamba_config"])
+        tc_mamba_config["dtf_threshold"] = float(
+            tc_args.get("dtf_threshold", 0.1)
         )
-        
-        # TC-Mamba
         self.text_based_context_mamba = TCMamba(
-            num_layers=args['model']['tc_mamba']['num_layers'],
-            d_model=args['model']['tc_mamba']['d_model'],
-            d_ffn=args['model']['tc_mamba']['d_model'] * 4,
-            activation=args['model']['tc_mamba']['activation'],
-            dropout=args['model']['tc_mamba']['dropout'],
-            causal=args['model']['tc_mamba']['causal'],
-            mamba_config=args['model']['tc_mamba']['mamba_config']
+            num_layers=tc_args["num_layers"],
+            d_model=tc_args["d_model"],
+            d_ffn=tc_args.get("d_ffn", tc_args["d_model"] * 4),
+            activation=tc_args["activation"],
+            dropout=tc_args["dropout"],
+            causal=tc_args["causal"],
+            mamba_config=tc_mamba_config,
         )
-        
-        # TQ-Mamba
+
+        tq_args = model_args["tq_mamba"]
         self.text_guided_attention = Crossattn(
-            num_heads=args['model']['tq_mamba']['attn_heads'],
-            d_model=args['model']['tq_mamba']['d_model'],
+            num_heads=tq_args["attn_heads"],
+            d_model=tq_args["d_model"],
+            modal_dim=2 * tq_args["d_model"],
+            dropout=tq_args["dropout"],
+            rope_base=tq_args.get("rope_base", 10000.0),
         )
         self.text_based_query_mamba = TQMamba(
-            num_layers=args['model']['tq_mamba']['num_layers'],
-            d_model=args['model']['tq_mamba']['d_model'],
-            d_ffn=args['model']['tq_mamba']['d_model'] * 4,
-            activation=args['model']['tq_mamba']['activation'],
-            dropout=args['model']['tq_mamba']['dropout'],
-            causal=args['model']['tq_mamba']['causal'],
-            mamba_config=args['model']['tq_mamba']['mamba_config']
+            num_layers=tq_args["num_layers"],
+            d_model=tq_args["d_model"],
+            d_ffn=tq_args.get("d_ffn", tq_args["d_model"] * 4),
+            activation=tq_args["activation"],
+            dropout=tq_args["dropout"],
+            causal=tq_args["causal"],
+            mamba_config=dict(tq_args["mamba_config"]),
         )
 
+        regression_dim = int(model_args["regression"]["input_dim"])
         self.pool = nn.AdaptiveMaxPool1d(1)
-        # 特征归一化锁 (Representation Normalization Lock)
-        # 防止极端缺失率下 Mamba 连续积分导致的数值膨胀，稳定回归头 MAE
-        self.norm_lock = nn.LayerNorm(args['model']['regression']['input_dim'])
-        self.output = nn.Linear(args['model']['regression']['input_dim'], args['model']['regression']['out_dim'])
+        self.norm_lock = nn.LayerNorm(regression_dim)
+        self.output = nn.Linear(
+            regression_dim,
+            int(model_args["regression"]["out_dim"]),
+        )
 
-    def forward(self, complete_input, incomplete_input):
-        vision, audio, language = complete_input
-        vision_m, audio_m, language_m = incomplete_input
+    @staticmethod
+    def _validate_text_mask(text_missing, text_valid):
+        if text_missing.shape != text_valid.shape:
+            raise ValueError("text missing and validity masks must have identical shapes")
+        missing = text_missing.to(dtype=torch.bool)
+        valid = text_valid.to(dtype=torch.bool)
+        if torch.any(missing & ~valid):
+            raise ValueError("text missing mask contains padding positions")
 
-        # ==========================================================
-        # [动态拦截拦截纯 0 噪声] 
-        # 检测哪些帧是完全缺失的 (全为 0)
-        v_is_missing = (vision_m == 0).all(dim=-1, keepdim=True) # [B, L, 1]
-        a_is_missing = (audio_m == 0).all(dim=-1, keepdim=True)  # [B, L, 1]
+    def forward(self, incomplete_input, missing_masks, valid_masks):
+        vision, audio, language = incomplete_input
+        text_missing, audio_missing, vision_missing = missing_masks
+        text_valid, audio_valid, vision_valid = valid_masks
+        self._validate_text_mask(text_missing, text_valid)
 
-        # 用可学习的 Token 替换掉纯 0 的帧
-        h_0_v = torch.where(v_is_missing, self.v_mask_token, vision_m)
-        h_0_a = torch.where(a_is_missing, self.a_mask_token, audio_m)
-        # ==========================================================
+        vision_stable = apply_missing_token(
+            vision,
+            vision_missing,
+            vision_valid,
+            self.v_mask_token,
+        )
+        audio_stable = apply_missing_token(
+            audio,
+            audio_missing,
+            audio_valid,
+            self.a_mask_token,
+        )
+        text_encoded = self.bertmodel(language)
 
-        h_0_t = self.bertmodel(language_m)
-        
-        h_tmm_t, h_tmm_v, h_tmm_a = self.text_modality_mixup(h_0_t, h_0_v, h_0_a)
-        
-        # 状态冻结 Mamba
-        h_tc_mamba_a, h_tc_mamba_v, h_tc_mamba_t = self.text_based_context_mamba(h_tmm_a, h_tmm_v, h_tmm_t)
+        aligned = self.text_modality_mixup(
+            text_encoded,
+            vision_stable,
+            audio_stable,
+            text_missing,
+            vision_missing,
+            audio_missing,
+            vision_valid,
+            audio_valid,
+        )
+        audio_out, vision_out, text_at, text_vt = self.text_based_context_mamba(
+            aligned.audio,
+            aligned.vision,
+            aligned.text,
+            aligned.text_missing,
+            aligned.audio_missing,
+            aligned.vision_missing,
+        )
+        text_query = (text_at + text_vt) / 2
+        modal_key_value = torch.cat((vision_out, audio_out), dim=-1)
+        attended = self.text_guided_attention(text_query, modal_key_value)
+        fused = self.text_based_query_mamba(attended)
+        pooled = self.pool(fused.transpose(1, 2)).squeeze(-1)
+        prediction = self.output(self.norm_lock(pooled))
+        return {"sentiment_preds": prediction}
 
-        h_tm_attn = self.text_guided_attention(h_tc_mamba_t, torch.cat([h_tc_mamba_a, h_tc_mamba_v], dim=1))
-        h_tm_mamba = self.text_based_query_mamba(h_tm_attn)
-
-        h_m_pool = self.pool(h_tm_mamba.permute(0, 2, 1)).squeeze(-1)
-        # 过一次 LayerNorm，把膨胀的特征强行拉回标准分布
-        h_m_pool_locked = self.norm_lock(h_m_pool) 
-        output = self.output(h_m_pool_locked)
-
-        rec_text_feats, com_text_feats = None, None
-        if (vision is not None) and (audio is not None) and (language is not None):
-            h_t_o = self.bertmodel(language)
-            text_recon_low = self.recon_text_low(h_tmm_t)
-            rec_text_feats = [text_recon_low]
-            com_text_feats = [h_t_o]
-
-        return {'sentiment_preds': output,
-                'rec_text': rec_text_feats,
-                'complete_text': com_text_feats}
 
 def build_model(args):
-    return TFMamba(args)
+    return CMSMamba(args)
