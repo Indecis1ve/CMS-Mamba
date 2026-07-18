@@ -54,6 +54,25 @@ class EvaluationProtocolTest(unittest.TestCase):
         self.assertNotIn("strict=False", source)
         self.assertIn("text_valid_mask", source)
         self.assertIn("text_missing_mask", source)
+        self.assertIn('default="fp32"', source)
+        self.assertNotIn("bfloat16", source)
+
+    def test_realized_text_rate_excludes_boundary_tokens(self):
+        tracker = robust_evaluation.MissingRateTracker()
+        batch = {
+            "text_valid_mask": torch.tensor([[1, 1, 1, 1, 0]]),
+            "text_missing_mask": torch.tensor([[0, 1, 1, 0, 0]]),
+            "audio_valid_mask": torch.tensor([[1, 1, 0]]),
+            "audio_missing_mask": torch.tensor([[1, 0, 0]]),
+            "vision_valid_mask": torch.tensor([[1, 1, 1]]),
+            "vision_missing_mask": torch.tensor([[0, 1, 0]]),
+        }
+
+        tracker.update(batch)
+
+        self.assertEqual(tracker.rates()["text"], 1.0)
+        self.assertEqual(tracker.rates()["audio"], 0.5)
+        self.assertAlmostEqual(tracker.rates()["vision"], 1 / 3)
 
 
 if __name__ == "__main__":

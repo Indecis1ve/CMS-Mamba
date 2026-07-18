@@ -91,6 +91,8 @@ python train.py --config_file configs/train_mosei.yaml
 python train.py --config_file configs/train_sims.yaml
 ```
 
+The manuscript's independent training runs use seeds `2024`, `2025`, and `2026`. The YAML default is `2024`; pass `--seed 2025` or `--seed 2026` for the other runs. These training seeds are distinct from validation/test mask seeds.
+
 For every sample and epoch, corruption is regenerated reproducibly from the training seed, epoch, and sample index. Each epoch is followed by validation on:
 
 - missing rates: `0.0`, `0.1`, `0.5`, `0.9`, `1.0`;
@@ -112,35 +114,37 @@ Evaluation requires a checkpoint trained with this revised architecture.
 # Continuous simultaneous corruption at eta = 0.5
 python robust_evaluation.py \
   --config_file configs/eval_mosei.yaml \
-  --ckpt_path ckpt/mosei/best_validation_MAE_1111.pth \
+  --ckpt_path ckpt/mosei/best_validation_MAE_2024.pth \
   --pattern continuous --missing_rate 0.5 --mask_seed 1111
 
 # Complete text missingness
 python robust_evaluation.py \
   --config_file configs/eval_mosei.yaml \
-  --ckpt_path ckpt/mosei/best_validation_MAE_1111.pth \
+  --ckpt_path ckpt/mosei/best_validation_MAE_2024.pth \
   --pattern text_missing
 
 # Complete audio + vision missingness
 python robust_evaluation.py \
   --config_file configs/eval_mosei.yaml \
-  --ckpt_path ckpt/mosei/best_validation_MAE_1111.pth \
+  --ckpt_path ckpt/mosei/best_validation_MAE_2024.pth \
   --pattern av_missing
 
 # Contiguous 50% block missingness
 python robust_evaluation.py \
   --config_file configs/eval_mosei.yaml \
-  --ckpt_path ckpt/mosei/best_validation_MAE_1111.pth \
+  --ckpt_path ckpt/mosei/best_validation_MAE_2024.pth \
   --pattern block --missing_rate 0.5
 
 # Independent corruption plus a contiguous burst
 python robust_evaluation.py \
   --config_file configs/eval_mosei.yaml \
-  --ckpt_path ckpt/mosei/best_validation_MAE_1111.pth \
+  --ckpt_path ckpt/mosei/best_validation_MAE_2024.pth \
   --pattern mixed_burst --missing_rate 0.2 --block_rate 0.3
 ```
 
 Named asymmetric conditions are `text_heavy` (`0.7/0.1/0.1`) and `av_heavy` (`0.1/0.7/0.7`). Use `--text_rate`, `--audio_rate`, and `--vision_rate` to override any condition explicitly. The report prints both requested and realized text/audio/vision missing rates.
+
+Evaluation defaults to the manuscript's server-side FP32 protocol. Use `--precision fp16` only for a compatible CUDA deployment such as the dedicated Jetson protocol.
 
 ## Lightweight verification
 

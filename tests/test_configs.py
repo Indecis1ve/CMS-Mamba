@@ -53,6 +53,7 @@ class ConfigContractTest(unittest.TestCase):
             with path.open(encoding="utf-8") as handle:
                 config = yaml.safe_load(handle)
             with self.subTest(path=path):
+                self.assertEqual(config["base"]["seed"], 2024)
                 self.assertEqual(
                     config["base"]["validation_missing_rates"],
                     [0.0, 0.1, 0.5, 0.9, 1.0],

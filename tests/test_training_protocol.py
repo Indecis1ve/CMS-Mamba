@@ -4,7 +4,11 @@ import unittest
 import torch
 
 from core.losses import MultimodalLoss
-from core.validation import ValidationCheckpointSelector, validation_grid
+from core.validation import (
+    ValidationCheckpointSelector,
+    regression_mae,
+    validation_grid,
+)
 
 
 class TrainingProtocolTest(unittest.TestCase):
@@ -36,6 +40,12 @@ class TrainingProtocolTest(unittest.TestCase):
         self.assertTrue(selector.update(0.7, 3))
         self.assertEqual(selector.best_epoch, 3)
 
+    def test_selection_mae_is_computed_without_metric_rounding(self):
+        predictions = torch.tensor([[0.123456], [0.333333]])
+        targets = torch.zeros_like(predictions)
+
+        self.assertAlmostEqual(regression_mae(predictions, targets), 0.2283945)
+
     def test_training_source_never_selects_on_test_metrics(self):
         source = Path("train.py").read_text(encoding="utf-8")
 
@@ -43,6 +53,10 @@ class TrainingProtocolTest(unittest.TestCase):
         self.assertIn("validation_grid", source)
         self.assertIn("set_epoch", source)
         self.assertIn("set_evaluation_corruption", source)
+        self.assertIn("regression_mae", source)
+
+        utils_source = Path("core/utils.py").read_text(encoding="utf-8")
+        self.assertNotIn("get_best_results", utils_source)
 
 
 if __name__ == "__main__":

@@ -97,8 +97,15 @@ class MissingRateTracker:
             valid = batch_data[f"{modality}_valid_mask"].to(dtype=torch.bool)
             if torch.any(missing & ~valid):
                 raise RuntimeError(f"{modality} missing mask includes padding")
-            self.missing[modality] += float((missing & valid).sum())
-            self.eligible[modality] += float(valid.sum())
+            eligible = valid.clone()
+            if modality == "text":
+                for row in eligible:
+                    positions = torch.nonzero(row, as_tuple=False).flatten()
+                    if positions.numel():
+                        row[positions[0]] = False
+                        row[positions[-1]] = False
+            self.missing[modality] += float((missing & eligible).sum())
+            self.eligible[modality] += float(eligible.sum())
 
     def rates(self) -> Dict[str, float]:
         return {
@@ -205,7 +212,7 @@ def parse_args():
     )
     parser.add_argument("--config_file", default="configs/eval_mosei.yaml")
     parser.add_argument(
-        "--ckpt_path", default="ckpt/mosei/best_validation_MAE_1111.pth"
+        "--ckpt_path", default="ckpt/mosei/best_validation_MAE_2024.pth"
     )
     parser.add_argument("--pattern", choices=PATTERNS, default="continuous")
     parser.add_argument("--missing_rate", type=float, default=0.5)
@@ -215,8 +222,10 @@ def parse_args():
     parser.add_argument("--block_rate", type=float, default=0.0)
     parser.add_argument("--mask_seed", type=int, default=1111)
     parser.add_argument("--num_workers", type=int)
+    parser.add_argument(
+        "--precision", choices=("fp32", "fp16"), default="fp32"
+    )
     parser.add_argument("--disable_jtop", action="store_true")
-    parser.add_argument("--disable_amp", action="store_true")
     return parser.parse_args()
 
 
@@ -270,7 +279,7 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str, device=DEVICE)
         ) from error
 
 
-def model_forward(model, batch_data, disable_amp: bool):
+def model_forward(model, batch_data, precision: str):
     incomplete_input = (
         batch_data["vision_m"].to(DEVICE),
         batch_data["audio_m"].to(DEVICE),
@@ -286,8 +295,10 @@ def model_forward(model, batch_data, disable_amp: bool):
         batch_data["audio_valid_mask"].to(DEVICE),
         batch_data["vision_valid_mask"].to(DEVICE),
     )
-    if USE_CUDA and not disable_amp:
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+    if precision == "fp16":
+        if not USE_CUDA:
+            raise RuntimeError("FP16 evaluation requires CUDA")
+        with torch.amp.autocast("cuda", dtype=torch.float16):
             return model(incomplete_input, missing_masks, valid_masks)
     return model(incomplete_input, missing_masks, valid_masks)
 
@@ -338,13 +349,13 @@ def evaluate_one_condition():
                     start_event = torch.cuda.Event(enable_timing=True)
                     end_event = torch.cuda.Event(enable_timing=True)
                     start_event.record()
-                    output = model_forward(model, batch_data, options.disable_amp)
+                    output = model_forward(model, batch_data, options.precision)
                     end_event.record()
                     torch.cuda.synchronize()
                     elapsed = start_event.elapsed_time(end_event) / 1000.0
                 else:
                     start = time.perf_counter()
-                    output = model_forward(model, batch_data, options.disable_amp)
+                    output = model_forward(model, batch_data, options.precision)
                     elapsed = time.perf_counter() - start
                 performance.latency_list.append(elapsed)
                 performance.update_memory()

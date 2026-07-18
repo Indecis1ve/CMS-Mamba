@@ -4,6 +4,18 @@ from dataclasses import dataclass
 from itertools import product
 from math import isfinite
 
+import torch
+
+
+def regression_mae(predictions, targets):
+    """Return unrounded sample-level MAE for checkpoint selection."""
+
+    if predictions.shape != targets.shape:
+        raise ValueError("predictions and targets must have identical shapes")
+    if predictions.numel() == 0:
+        raise ValueError("predictions and targets cannot be empty")
+    return float(torch.mean(torch.abs(predictions - targets)).item())
+
 
 def validation_grid(rates, seeds):
     grid = tuple(

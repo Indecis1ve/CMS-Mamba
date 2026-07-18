@@ -2,7 +2,6 @@
 
 import argparse
 import os
-import warnings
 
 import numpy as np
 import torch
@@ -13,11 +12,12 @@ from core.losses import MultimodalLoss
 from core.metric import MetricsTop
 from core.scheduler import get_scheduler
 from core.utils import save_model, setup_seed
-from core.validation import ValidationCheckpointSelector, validation_grid
+from core.validation import (
+    ValidationCheckpointSelector,
+    regression_mae,
+    validation_grid,
+)
 from models.TFMamba import build_model
-
-
-warnings.filterwarnings("ignore")
 
 
 def parse_args():
@@ -86,7 +86,9 @@ def evaluate(model, eval_loader, device, metrics):
 
     if not predictions:
         raise RuntimeError("evaluation loader produced no batches")
-    return metrics(torch.cat(predictions), torch.cat(targets))
+    predictions = torch.cat(predictions)
+    targets = torch.cat(targets)
+    return metrics(predictions, targets), regression_mae(predictions, targets)
 
 
 def evaluate_validation_grid(model, valid_loader, device, metrics, base_args):
@@ -101,12 +103,12 @@ def evaluate_validation_grid(model, valid_loader, device, metrics, base_args):
             rates=(missing_rate, missing_rate, missing_rate),
             seed=mask_seed,
         )
-        result = evaluate(model, valid_loader, device, metrics)
+        result, selection_mae = evaluate(model, valid_loader, device, metrics)
         condition_results.append(
             {
                 "missing_rate": missing_rate,
                 "mask_seed": mask_seed,
-                "MAE": float(result["MAE"]),
+                "MAE": selection_mae,
             }
         )
 
