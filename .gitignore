@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local research assets are not part of the source distribution.
+data/
+bert-base-uncased/
+bert-base-chinese/
+log/
+ckpt/*.pth
