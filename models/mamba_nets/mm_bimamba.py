@@ -1,200 +1,340 @@
-'''
-Copied and modified from XX
-'''
+"""Bidirectional multimodal Mamba with paper-aligned DTF control."""
 
 import math
-from typing import Optional
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch import Tensor
-from einops import rearrange, repeat
+from torch import nn
 
-try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-except ImportError:
-    causal_conv1d_fn, causal_conv1d_update = None
-
-from models.mamba_nets.selective_scan_interface import selective_scan_fn, mamba_inner_fn, bimamba_inner_fn, \
-    mamba_inner_fn_no_out_proj
-
-try:
-    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
-except ImportError:
-    selective_state_update = None
-
-try:
-    from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
-except ImportError:
-    RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
+from models.mamba_nets.selective_scan_interface import selective_scan_fn
+from models.missingness import DynamicTimeFreezing
 
 
 class Mamba(nn.Module):
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dt_rank="auto", dt_min=0.001, dt_max=0.1, dt_init="random", dt_scale=1.0, dt_init_floor=1e-4, conv_bias=True, bias=False, use_fast_path=True, layer_idx=None, device=None, dtype=None, bimamba_type="none", if_devide_out=True, init_layer_scale=None):
-        factory_kwargs = {"device": device, "dtype": dtype}
+    """Two-stream bidirectional selective scan used by TC-Mamba.
+
+    Both streams receive the same branch-specific missingness indicator, but
+    own independent feature/mask gates and SSM input projections.
+    """
+
+    def __init__(
+        self,
+        d_model,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+        dt_rank="auto",
+        dt_min=0.001,
+        dt_max=0.1,
+        dt_init="random",
+        dt_scale=1.0,
+        dt_init_floor=1e-4,
+        conv_bias=True,
+        bias=False,
+        use_fast_path=True,
+        layer_idx=None,
+        device=None,
+        dtype=None,
+        bimamba_type="none",
+        if_devide_out=True,
+        init_layer_scale=None,
+        dtf_threshold=0.1,
+    ):
         super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.expand = expand
-        self.d_inner = int(self.expand * self.d_model)
-        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+        if bimamba_type != "v2":
+            raise ValueError("multimodal DTF Mamba requires bimamba_type='v2'")
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.d_model = int(d_model)
+        self.d_state = int(d_state)
+        self.d_conv = int(d_conv)
+        self.expand = int(expand)
+        self.d_inner = self.expand * self.d_model
+        self.dt_rank = (
+            math.ceil(self.d_model / 16) if dt_rank == "auto" else int(dt_rank)
+        )
         self.use_fast_path = False
         self.layer_idx = layer_idx
         self.bimamba_type = bimamba_type
         self.if_devide_out = if_devide_out
-        assert bimamba_type == 'v2'
 
-        self.init_layer_scale = init_layer_scale
-        if init_layer_scale is not None:
-            self.a_gamma = nn.Parameter(init_layer_scale * torch.ones((d_model)), requires_grad=True)
-            self.v_gammagamma = nn.Parameter(init_layer_scale * torch.ones((d_model)), requires_grad=True)
-
-        self.a_in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
-        self.v_in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
-        self.a_conv1d = nn.Conv1d(in_channels=self.d_inner, out_channels=self.d_inner, bias=conv_bias, kernel_size=d_conv, groups=self.d_inner, padding=d_conv - 1, **factory_kwargs)
-        self.v_conv1d = nn.Conv1d(in_channels=self.d_inner, out_channels=self.d_inner, bias=conv_bias, kernel_size=d_conv, groups=self.d_inner, padding=d_conv - 1, **factory_kwargs)
-        self.activation = "silu"
+        self.a_in_proj = nn.Linear(
+            self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs
+        )
+        self.v_in_proj = nn.Linear(
+            self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs
+        )
+        self.a_conv1d = self._depthwise_conv(conv_bias, factory_kwargs)
+        self.v_conv1d = self._depthwise_conv(conv_bias, factory_kwargs)
+        self.a_conv1d_b = self._depthwise_conv(conv_bias, factory_kwargs)
+        self.v_conv1d_b = self._depthwise_conv(conv_bias, factory_kwargs)
         self.act = nn.SiLU()
 
-        self.a_x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs)
-        self.a_dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
-        self.v_x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs)
-        self.v_dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+        projection_dim = self.dt_rank + self.d_state * 2
+        self.a_x_proj = nn.Linear(
+            self.d_inner, projection_dim, bias=False, **factory_kwargs
+        )
+        self.v_x_proj = nn.Linear(
+            self.d_inner, projection_dim, bias=False, **factory_kwargs
+        )
+        self.a_x_proj_b = nn.Linear(
+            self.d_inner, projection_dim, bias=False, **factory_kwargs
+        )
+        self.v_x_proj_b = nn.Linear(
+            self.d_inner, projection_dim, bias=False, **factory_kwargs
+        )
+        self.a_dt_proj = nn.Linear(
+            self.dt_rank, self.d_inner, bias=True, **factory_kwargs
+        )
+        self.v_dt_proj = nn.Linear(
+            self.dt_rank, self.d_inner, bias=True, **factory_kwargs
+        )
+        self.a_dt_proj_b = nn.Linear(
+            self.dt_rank, self.d_inner, bias=True, **factory_kwargs
+        )
+        self.v_dt_proj_b = nn.Linear(
+            self.dt_rank, self.d_inner, bias=True, **factory_kwargs
+        )
+        for projection in (
+            self.a_dt_proj,
+            self.v_dt_proj,
+            self.a_dt_proj_b,
+            self.v_dt_proj_b,
+        ):
+            self._initialize_dt_projection(
+                projection,
+                dt_min,
+                dt_max,
+                dt_init,
+                dt_scale,
+                dt_init_floor,
+                factory_kwargs,
+            )
 
-        dt_init_std = self.dt_rank ** -0.5 * dt_scale
-        if dt_init == "constant":
-            nn.init.constant_(self.a_dt_proj.weight, dt_init_std)
-            nn.init.constant_(self.v_dt_proj.weight, dt_init_std)
-        elif dt_init == "random":
-            nn.init.uniform_(self.a_dt_proj.weight, -dt_init_std, dt_init_std)
-            nn.init.uniform_(self.v_dt_proj.weight, -dt_init_std, dt_init_std)
-        else:
-            raise NotImplementedError
+        self.a_dtf = DynamicTimeFreezing(
+            self.d_inner,
+            mask_dim=2,
+            threshold=dtf_threshold,
+            **factory_kwargs,
+        )
+        self.v_dtf = DynamicTimeFreezing(
+            self.d_inner,
+            mask_dim=2,
+            threshold=dtf_threshold,
+            **factory_kwargs,
+        )
 
-        a_dt = torch.exp(torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)).clamp(min=dt_init_floor)
-        a_inv_dt = a_dt + torch.log(-torch.expm1(-a_dt))
-        with torch.no_grad():
-            self.a_dt_proj.bias.copy_(a_inv_dt)
-        self.a_dt_proj.bias._no_reinit = True
-
-        v_dt = torch.exp(torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)).clamp(min=dt_init_floor)
-        v_inv_dt = v_dt + torch.log(-torch.expm1(-v_dt))
-        with torch.no_grad():
-            self.v_dt_proj.bias.copy_(v_inv_dt)
-        self.v_dt_proj.bias._no_reinit = True
-
-        # ==========================================================
-        # 用单维度标量来评估自己当前帧是否是噪声/缺失
-        self.a_time_gate = nn.Linear(self.d_inner, 1, bias=True, **factory_kwargs)
-        self.v_time_gate = nn.Linear(self.d_inner, 1, bias=True, **factory_kwargs)
-        
-        with torch.no_grad():
-            self.a_time_gate.bias.fill_(2.0)
-            self.v_time_gate.bias.fill_(2.0)
-        # ==========================================================
-
-        A = repeat(torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device), "n -> d n", d=self.d_inner).contiguous()
-        self.A_log = nn.Parameter(torch.log(A))
+        state_axis = torch.arange(
+            1,
+            self.d_state + 1,
+            dtype=torch.float32,
+            device=device,
+        )
+        state_matrix = state_axis.unsqueeze(0).repeat(self.d_inner, 1).contiguous()
+        self.A_log = nn.Parameter(torch.log(state_matrix))
         self.A_log._no_weight_decay = True
+        self.A_b_log = nn.Parameter(torch.log(state_matrix.clone()))
+        self.A_b_log._no_weight_decay = True
 
-        self.a_D = nn.Parameter(torch.ones(self.d_inner, device=device))
-        self.a_D._no_weight_decay = True
-        self.v_D = nn.Parameter(torch.ones(self.d_inner, device=device))
-        self.v_D._no_weight_decay = True
+        self.a_D = self._skip_parameter(device)
+        self.v_D = self._skip_parameter(device)
+        self.a_D_b = self._skip_parameter(device)
+        self.v_D_b = self._skip_parameter(device)
 
-        if bimamba_type == "v2":
-            A_b = repeat(torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device), "n -> d n", d=self.d_inner).contiguous()
-            self.A_b_log = nn.Parameter(torch.log(A_b))
-            self.A_b_log._no_weight_decay = True
+        self.a_out_proj = nn.Linear(
+            self.d_inner, self.d_model, bias=bias, **factory_kwargs
+        )
+        self.v_out_proj = nn.Linear(
+            self.d_inner, self.d_model, bias=bias, **factory_kwargs
+        )
+        self.a_gamma = None
+        self.v_gamma = None
+        if init_layer_scale is not None:
+            self.a_gamma = nn.Parameter(
+                float(init_layer_scale) * torch.ones(self.d_model, **factory_kwargs)
+            )
+            self.v_gamma = nn.Parameter(
+                float(init_layer_scale) * torch.ones(self.d_model, **factory_kwargs)
+            )
+        self.last_dtf_stats = {}
 
-            self.a_conv1d_b = nn.Conv1d(in_channels=self.d_inner, out_channels=self.d_inner, bias=conv_bias, kernel_size=d_conv, groups=self.d_inner, padding=d_conv - 1, **factory_kwargs)
-            self.v_conv1d_b = nn.Conv1d(in_channels=self.d_inner, out_channels=self.d_inner, bias=conv_bias, kernel_size=d_conv, groups=self.d_inner, padding=d_conv - 1, **factory_kwargs)
+    def _depthwise_conv(self, conv_bias, factory_kwargs):
+        return nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            bias=conv_bias,
+            kernel_size=self.d_conv,
+            groups=self.d_inner,
+            padding=self.d_conv - 1,
+            **factory_kwargs,
+        )
 
-            self.a_x_proj_b = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs)
-            self.a_dt_proj_b = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+    def _skip_parameter(self, device):
+        parameter = nn.Parameter(torch.ones(self.d_inner, device=device))
+        parameter._no_weight_decay = True
+        return parameter
 
-            self.v_x_proj_b = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs)
-            self.v_dt_proj_b = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+    def _initialize_dt_projection(
+        self,
+        projection,
+        dt_min,
+        dt_max,
+        dt_init,
+        dt_scale,
+        dt_init_floor,
+        factory_kwargs,
+    ):
+        init_std = self.dt_rank ** -0.5 * dt_scale
+        if dt_init == "constant":
+            nn.init.constant_(projection.weight, init_std)
+        elif dt_init == "random":
+            nn.init.uniform_(projection.weight, -init_std, init_std)
+        else:
+            raise ValueError(f"unsupported dt_init: {dt_init}")
+        initial = torch.exp(
+            torch.rand(self.d_inner, **factory_kwargs)
+            * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inverse_softplus = initial + torch.log(-torch.expm1(-initial))
+        with torch.no_grad():
+            projection.bias.copy_(inverse_softplus)
+        projection.bias._no_reinit = True
 
-            self.a_D_b = nn.Parameter(torch.ones(self.d_inner, device=device))
-            self.a_D_b._no_weight_decay = True
-            self.v_D_b = nn.Parameter(torch.ones(self.d_inner, device=device))
-            self.v_D_b._no_weight_decay = True
+    def _project_direction(self, x, x_projection, dt_projection, dtf, indicator):
+        # x is [B, D_inner, L]; DTF works on [B, L, D_inner].
+        features = x.transpose(1, 2).contiguous()
+        projected = x_projection(features)
+        dt_rank, state_b, state_c = torch.split(
+            projected,
+            [self.dt_rank, self.d_state, self.d_state],
+            dim=-1,
+        )
+        dt_projected = dt_projection(dt_rank)
+        dtf_output = dtf(features, dt_projected, indicator)
+        return (
+            dtf_output.delta.transpose(1, 2).contiguous(),
+            state_b.transpose(1, 2).contiguous(),
+            state_c.transpose(1, 2).contiguous(),
+            dtf_output,
+        )
 
-        self.a_out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
-        self.v_out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+    @staticmethod
+    def _diagnostic(output):
+        return {
+            "alpha": output.alpha.detach().cpu(),
+            "delta": output.delta.detach().cpu(),
+            "delta_base": output.delta_base.detach().cpu(),
+        }
 
-    def forward(self, a_hidden_states, v_hidden_states, a_inference_params=None, v_inference_params=None):
-        batch, seqlen, dim = a_hidden_states.shape
-        
-        a_xz = rearrange(self.a_in_proj.weight @ rearrange(a_hidden_states, "b l d -> d (b l)"), "d (b l) -> b d l", l=seqlen)
-        if self.a_in_proj.bias is not None:
-            a_xz = a_xz + rearrange(self.a_in_proj.bias.to(dtype=a_xz.dtype), "d -> d 1")
-            
-        v_xz = rearrange(self.v_in_proj.weight @ rearrange(v_hidden_states, "b l d -> d (b l)"), "d (b l) -> b d l", l=seqlen)
-        if self.v_in_proj.bias is not None:
-            v_xz = v_xz + rearrange(self.v_in_proj.bias.to(dtype=v_xz.dtype), "d -> d 1")
+    def forward(
+        self,
+        a_hidden_states,
+        v_hidden_states,
+        missing_indicator,
+        a_inference_params=None,
+        v_inference_params=None,
+    ):
+        del a_inference_params, v_inference_params
+        if a_hidden_states.shape != v_hidden_states.shape:
+            raise ValueError("TC-Mamba stream tensors must have identical shapes")
+        if a_hidden_states.ndim != 3:
+            raise ValueError("TC-Mamba streams must have shape [B, L, D]")
+        batch, sequence_length, _ = a_hidden_states.shape
+        expected_mask_shape = (batch, sequence_length, 2)
+        if missing_indicator.shape != expected_mask_shape:
+            raise ValueError(
+                f"missing indicator must have shape {expected_mask_shape}, "
+                f"got {missing_indicator.shape}"
+            )
+        indicator = missing_indicator.to(
+            device=a_hidden_states.device,
+            dtype=a_hidden_states.dtype,
+        )
 
-        A = -torch.exp(self.A_log.float())
-
+        a_xz = self.a_in_proj(a_hidden_states).transpose(1, 2).contiguous()
+        v_xz = self.v_in_proj(v_hidden_states).transpose(1, 2).contiguous()
         a_x, a_z = a_xz.chunk(2, dim=1)
         v_x, v_z = v_xz.chunk(2, dim=1)
+        a_x = self.act(self.a_conv1d(a_x)[..., :sequence_length])
+        v_x = self.act(self.v_conv1d(v_x)[..., :sequence_length])
 
-        a_x = self.act(self.a_conv1d(a_x)[..., :seqlen])
-        v_x = self.act(self.v_conv1d(v_x)[..., :seqlen])
+        a_dt, a_b, a_c, a_dtf_f = self._project_direction(
+            a_x, self.a_x_proj, self.a_dt_proj, self.a_dtf, indicator
+        )
+        v_dt, v_b, v_c, v_dtf_f = self._project_direction(
+            v_x, self.v_x_proj, self.v_dt_proj, self.v_dtf, indicator
+        )
 
-        # ==========================================================
-        # Dynamic Time-Freezing (DTF) Mechanism
-        a_x_flat = rearrange(a_x, "b d l -> (b l) d")
-        v_x_flat = rearrange(v_x, "b d l -> (b l) d")
+        a_xz_b = a_xz.flip(-1)
+        v_xz_b = v_xz.flip(-1)
+        a_x_b, a_z_b = a_xz_b.chunk(2, dim=1)
+        v_x_b, v_z_b = v_xz_b.chunk(2, dim=1)
+        a_x_b = self.act(self.a_conv1d_b(a_x_b)[..., :sequence_length])
+        v_x_b = self.act(self.v_conv1d_b(v_x_b)[..., :sequence_length])
+        indicator_b = indicator.flip(1)
+        a_dt_b, a_b_b, a_c_b, a_dtf_b = self._project_direction(
+            a_x_b, self.a_x_proj_b, self.a_dt_proj_b, self.a_dtf, indicator_b
+        )
+        v_dt_b, v_b_b, v_c_b, v_dtf_b = self._project_direction(
+            v_x_b, self.v_x_proj_b, self.v_dt_proj_b, self.v_dtf, indicator_b
+        )
 
-        a_x_dbl = self.a_x_proj(a_x_flat)
-        a_dt, a_B, a_C = torch.split(a_x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        state_a = -torch.exp(self.A_log.float())
+        state_b = -torch.exp(self.A_b_log.float())
+        a_y = selective_scan_fn(
+            a_x,
+            a_dt,
+            state_a,
+            a_b,
+            a_c,
+            self.a_D.float(),
+            z=a_z,
+            delta_bias=None,
+            delta_softplus=False,
+        )
+        v_y = selective_scan_fn(
+            v_x,
+            v_dt,
+            state_a,
+            v_b,
+            v_c,
+            self.v_D.float(),
+            z=v_z,
+            delta_bias=None,
+            delta_softplus=False,
+        )
+        a_y_b = selective_scan_fn(
+            a_x_b,
+            a_dt_b,
+            state_b,
+            a_b_b,
+            a_c_b,
+            self.a_D_b.float(),
+            z=a_z_b,
+            delta_bias=None,
+            delta_softplus=False,
+        )
+        v_y_b = selective_scan_fn(
+            v_x_b,
+            v_dt_b,
+            state_b,
+            v_b_b,
+            v_c_b,
+            self.v_D_b.float(),
+            z=v_z_b,
+            delta_bias=None,
+            delta_softplus=False,
+        )
 
-        v_x_dbl = self.v_x_proj(v_x_flat)
-        v_dt, v_B, v_C = torch.split(v_x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        a_out = self.a_out_proj((a_y + a_y_b.flip(-1)).transpose(1, 2))
+        v_out = self.v_out_proj((v_y + v_y_b.flip(-1)).transpose(1, 2))
+        if self.a_gamma is not None:
+            a_out = a_out * self.a_gamma
+            v_out = v_out * self.v_gamma
 
-        # 1. 评估自身健康状态
-        a_health_gate = torch.sigmoid(self.a_time_gate(a_x_flat))
-        v_health_gate = torch.sigmoid(self.v_time_gate(v_x_flat))
-
-        # 2. 投影出原始步长 dt_proj (包含 bias)
-        a_dt_proj = (self.a_dt_proj.weight @ a_dt.t()) + rearrange(self.a_dt_proj.bias.to(dtype=a_dt.dtype), "d -> d 1")
-        v_dt_proj = (self.v_dt_proj.weight @ v_dt.t()) + rearrange(self.v_dt_proj.bias.to(dtype=v_dt.dtype), "d -> d 1")
-
-        # 3. 计算 Base Step (通过 Softplus，严格对应公式: \Delta_base = ln(1 + exp(\Delta_proj)))
-        a_dt_base = F.softplus(a_dt_proj)
-        v_dt_base = F.softplus(v_dt_proj)
-
-        # 4. Multiplicative Gating (乘法门控，严格对应公式: \Delta_t = \alpha_t * \Delta_base)
-        a_dt_frozen = a_dt_base * a_health_gate.t()
-        v_dt_frozen = v_dt_base * v_health_gate.t()
-
-        self.vis_alpha_a = a_health_gate.detach().cpu()
-        self.vis_alpha_v = v_health_gate.detach().cpu()
-        self.vis_a_dt = a_dt_frozen.detach().cpu() # 直接抓取最终 frozen 后的实际步长
-        self.vis_v_dt = v_dt_frozen.detach().cpu()
-
-
-        a_dt = rearrange(a_dt_frozen, "d (b l) -> b d l", l=seqlen)
-        a_B = rearrange(a_B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-        a_C = rearrange(a_C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-
-        v_dt = rearrange(v_dt_frozen, "d (b l) -> b d l", l=seqlen)
-        v_B = rearrange(v_B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-        v_C = rearrange(v_C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-        # ==========================================================
-
-
-        a_y = selective_scan_fn(a_x, a_dt, A, a_B, a_C, self.a_D.float(), z=a_z, delta_bias=None, delta_softplus=False)
-        v_y = selective_scan_fn(v_x, v_dt, A, v_B, v_C, self.v_D.float(), z=v_z, delta_bias=None, delta_softplus=False)
-
-        a_y = rearrange(a_y, "b d l -> b l d")
-        a_out = self.a_out_proj(a_y)
-
-        v_y = rearrange(v_y, "b d l -> b l d")
-        v_out = self.v_out_proj(v_y)
-
+        self.last_dtf_stats = {
+            "a_forward": self._diagnostic(a_dtf_f),
+            "a_backward": self._diagnostic(a_dtf_b),
+            "v_forward": self._diagnostic(v_dtf_f),
+            "v_backward": self._diagnostic(v_dtf_b),
+        }
         return a_out, v_out
