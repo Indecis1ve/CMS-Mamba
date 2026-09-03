@@ -99,7 +99,7 @@ For an aligned representation $x_t$ and its branch-specific missingness vector $
 $$
 \alpha_t = \sigma(W_g x_t + W_m m_t + b_g),
 \qquad
-\Delta_{\mathrm{base},t} = \operatorname{Softplus}(W_\Delta x_t + b_\Delta),
+\Delta_{\mathrm{base},t} = \mathrm{Softplus}(W_\Delta x_t + b_\Delta),
 \qquad
 \Delta_t = \alpha_t \Delta_{\mathrm{base},t}.
 $$
