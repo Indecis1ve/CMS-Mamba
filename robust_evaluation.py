@@ -285,7 +285,12 @@ def model_forward(model, batch_data, precision: str):
         batch_data["audio_m"].to(DEVICE),
         batch_data["text_m"].to(DEVICE),
     )
-    missing_masks = (
+    automatic_masks = (
+        batch_data["text_auto_missing_mask"].to(DEVICE),
+        batch_data["audio_auto_missing_mask"].to(DEVICE),
+        batch_data["vision_auto_missing_mask"].to(DEVICE),
+    )
+    reference_masks = (
         batch_data["text_missing_mask"].to(DEVICE),
         batch_data["audio_missing_mask"].to(DEVICE),
         batch_data["vision_missing_mask"].to(DEVICE),
@@ -295,12 +300,31 @@ def model_forward(model, batch_data, precision: str):
         batch_data["audio_valid_mask"].to(DEVICE),
         batch_data["vision_valid_mask"].to(DEVICE),
     )
+    indicator_source = str(
+        getattr(model, "mcssm_indicator_source", "automatic")
+    ).lower()
+    if indicator_source == "automatic":
+        conditioning_masks = automatic_masks
+    elif indicator_source == "reference":
+        conditioning_masks = reference_masks
+    else:
+        raise ValueError("mcssm_indicator_source must be 'automatic' or 'reference'")
     if precision == "fp16":
         if not USE_CUDA:
             raise RuntimeError("FP16 evaluation requires CUDA")
         with torch.amp.autocast("cuda", dtype=torch.float16):
-            return model(incomplete_input, missing_masks, valid_masks)
-    return model(incomplete_input, missing_masks, valid_masks)
+            return model(
+                incomplete_input,
+                automatic_masks,
+                valid_masks,
+                conditioning_masks=conditioning_masks,
+            )
+    return model(
+        incomplete_input,
+        automatic_masks,
+        valid_masks,
+        conditioning_masks=conditioning_masks,
+    )
 
 
 def evaluate_one_condition():
@@ -326,6 +350,9 @@ def evaluate_one_condition():
     from models.TFMamba import build_model
 
     model = build_model(args).to(DEVICE)
+    model.mcssm_indicator_source = args["base"].get(
+        "mcssm_indicator_source", "automatic"
+    )
     load_checkpoint(model, options.ckpt_path)
     model.eval()
 
