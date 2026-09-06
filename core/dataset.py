@@ -8,9 +8,13 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from core.missingness import (
+    automatic_continuous_missingness,
+    automatic_text_missingness,
     corrupt_continuous,
     corrupt_text,
     evaluation_missingness,
+    fit_continuous_feature_statistics,
+    standardize_received_continuous,
     training_missingness,
 )
 
@@ -21,9 +25,9 @@ __all__ = ["MMDataset", "MMDataLoader", "MMDataEvaluationLoader"]
 class MMDataset(Dataset):
     """CMU-MOSI/MOSEI/CH-SIMS features with paper-aligned corruption.
 
-    Missing masks returned by this class use ``1 = missing``. Validity masks
-    are returned separately, so padding and genuine zero features are never
-    interpreted as missing observations.
+    Reference masks record synthetic corruption, while automatic masks are
+    derived from the received corrupted inputs.  Validity masks are returned
+    separately so padding never becomes a missing observation.
     """
 
     def __init__(self, args, mode="train"):
@@ -33,6 +37,11 @@ class MMDataset(Dataset):
         self.data_path = args["dataset"]["dataPath"]
         self.missing_seed = int(args["base"].get("seed", 1111))
         self.epoch = 0
+        estimator = args["base"].get("automatic_missingness", {})
+        self.audio_threshold = float(estimator.get("audio_threshold", 0.18))
+        self.vision_threshold = float(estimator.get("vision_threshold", 0.21))
+        if self.audio_threshold < 0.0 or self.vision_threshold < 0.0:
+            raise ValueError("automatic missingness thresholds must be non-negative")
 
         self.eval_pattern = str(
             args["base"].get("missing_pattern", "independent")
@@ -49,7 +58,6 @@ class MMDataset(Dataset):
         self.text = data["text_bert"].astype(np.float32)
         self.vision = data["vision"].astype(np.float32)
         self.audio = data["audio"].astype(np.float32)
-        self.audio[self.audio == -np.inf] = 0
         self.audio_lengths = np.asarray(data["audio_lengths"], dtype=np.int64)
         self.vision_lengths = np.asarray(data["vision_lengths"], dtype=np.int64)
         self.raw_text = data.get("raw_text", np.array([""] * len(self.text)))
@@ -65,6 +73,29 @@ class MMDataset(Dataset):
 
         self._validate_lengths()
         self._validate_feature_dimensions(args)
+        self.audio_statistics, self.vision_statistics = self._fit_training_statistics(
+            payload
+        )
+
+    def _fit_training_statistics(self, payload):
+        if "train" not in payload:
+            raise KeyError("automatic missingness requires the training split")
+        train_data = payload["train"]
+        for key in ("audio", "vision", "audio_lengths", "vision_lengths"):
+            if key not in train_data:
+                raise KeyError(
+                    f"automatic missingness requires train split field {key!r}"
+                )
+        return (
+            fit_continuous_feature_statistics(
+                train_data["audio"],
+                train_data["audio_lengths"],
+            ),
+            fit_continuous_feature_statistics(
+                train_data["vision"],
+                train_data["vision_lengths"],
+            ),
+        )
 
     @staticmethod
     def _normalize_modalities(modalities) -> set[str]:
@@ -214,9 +245,36 @@ class MMDataset(Dataset):
             )
 
         input_ids = corrupt_text(self.text[index, 0, :], missing.text)
+        text_auto_missing = automatic_text_missingness(input_ids, valid["text"])
         text_m = np.stack(
             (input_ids, self.text[index, 1, :], self.text[index, 2, :])
         ).astype(np.float32)
+
+        audio_received = corrupt_continuous(self.audio[index], missing.audio)
+        audio_m, audio_direct_missing = standardize_received_continuous(
+            audio_received,
+            valid["audio"],
+            self.audio_statistics,
+        )
+        audio_auto_missing = automatic_continuous_missingness(
+            audio_m,
+            valid["audio"],
+            audio_direct_missing,
+            self.audio_threshold,
+        )
+
+        vision_received = corrupt_continuous(self.vision[index], missing.vision)
+        vision_m, vision_direct_missing = standardize_received_continuous(
+            vision_received,
+            valid["vision"],
+            self.vision_statistics,
+        )
+        vision_auto_missing = automatic_continuous_missingness(
+            vision_m,
+            valid["vision"],
+            vision_direct_missing,
+            self.vision_threshold,
+        )
 
         labels = {
             name: torch.from_numpy(np.asarray(values[index]).reshape(-1)).float()
@@ -227,21 +285,26 @@ class MMDataset(Dataset):
             "text_m": torch.from_numpy(text_m).float(),
             "text_valid_mask": torch.from_numpy(valid["text"].astype(np.float32)),
             "text_missing_mask": torch.from_numpy(missing.text.astype(np.float32)),
+            "text_auto_missing_mask": torch.from_numpy(
+                text_auto_missing.astype(np.float32)
+            ),
             "audio": torch.from_numpy(self.audio[index]).float(),
-            "audio_m": torch.from_numpy(
-                corrupt_continuous(self.audio[index], missing.audio)
-            ).float(),
+            "audio_m": torch.from_numpy(audio_m).float(),
             "audio_valid_mask": torch.from_numpy(valid["audio"].astype(np.float32)),
             "audio_missing_mask": torch.from_numpy(missing.audio.astype(np.float32)),
+            "audio_auto_missing_mask": torch.from_numpy(
+                audio_auto_missing.astype(np.float32)
+            ),
             "vision": torch.from_numpy(self.vision[index]).float(),
-            "vision_m": torch.from_numpy(
-                corrupt_continuous(self.vision[index], missing.vision)
-            ).float(),
+            "vision_m": torch.from_numpy(vision_m).float(),
             "vision_valid_mask": torch.from_numpy(
                 valid["vision"].astype(np.float32)
             ),
             "vision_missing_mask": torch.from_numpy(
                 missing.vision.astype(np.float32)
+            ),
+            "vision_auto_missing_mask": torch.from_numpy(
+                vision_auto_missing.astype(np.float32)
             ),
             "requested_missing_rate": torch.tensor(
                 missing.eta, dtype=torch.float32
