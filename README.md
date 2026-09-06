@@ -29,7 +29,7 @@ flowchart TD
 
 For an input $x_t$ and observation indicator $m_t$, MCSSM computes
 
-$$\alpha_t=\sigma(W_gx_t+W_mm_t+b_g), \qquad \Delta_t=\alpha_t\odot\operatorname{Softplus}(W_\Delta x_t+b_\Delta).$$
+$$\alpha_t=\sigma(W_gx_t+W_mm_t+b_g), \qquad \Delta_t=\alpha_t\odot\mathrm{softplus}(W_\Delta x_t+b_\Delta).$$
 
 The modulated step $\Delta_t$ is used in the zero-order-hold discretization of the state-space model. As $\Delta_t\rightarrow0$, the transition approaches the identity and the input contribution approaches zero, so the latent state is approximately retained instead of being overwritten by an unreliable observation.
 
