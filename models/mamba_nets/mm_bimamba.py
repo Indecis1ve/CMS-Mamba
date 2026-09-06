@@ -1,4 +1,4 @@
-"""Bidirectional multimodal Mamba with paper-aligned DTF control."""
+"""Bidirectional multimodal Mamba with paper-aligned MCSSM control."""
 
 import math
 
@@ -6,14 +6,14 @@ import torch
 from torch import nn
 
 from models.mamba_nets.selective_scan_interface import selective_scan_fn
-from models.missingness import DynamicTimeFreezing
+from models.missingness import MissingnessConditionedStep
 
 
 class Mamba(nn.Module):
     """Two-stream bidirectional selective scan used by TC-Mamba.
 
     Both streams receive the same branch-specific missingness indicator, but
-    own independent feature/mask gates and SSM input projections.
+    own independent MCSSM gates and SSM input projections.
     """
 
     def __init__(
@@ -37,11 +37,10 @@ class Mamba(nn.Module):
         bimamba_type="none",
         if_devide_out=True,
         init_layer_scale=None,
-        dtf_threshold=0.1,
     ):
         super().__init__()
         if bimamba_type != "v2":
-            raise ValueError("multimodal DTF Mamba requires bimamba_type='v2'")
+            raise ValueError("multimodal MCSSM Mamba requires bimamba_type='v2'")
         factory_kwargs = {"device": device, "dtype": dtype}
         self.d_model = int(d_model)
         self.d_state = int(d_state)
@@ -109,16 +108,14 @@ class Mamba(nn.Module):
                 factory_kwargs,
             )
 
-        self.a_dtf = DynamicTimeFreezing(
+        self.a_mcssm = MissingnessConditionedStep(
             self.d_inner,
             mask_dim=2,
-            threshold=dtf_threshold,
             **factory_kwargs,
         )
-        self.v_dtf = DynamicTimeFreezing(
+        self.v_mcssm = MissingnessConditionedStep(
             self.d_inner,
             mask_dim=2,
-            threshold=dtf_threshold,
             **factory_kwargs,
         )
 
@@ -154,7 +151,7 @@ class Mamba(nn.Module):
             self.v_gamma = nn.Parameter(
                 float(init_layer_scale) * torch.ones(self.d_model, **factory_kwargs)
             )
-        self.last_dtf_stats = {}
+        self.last_mcssm_stats = {}
 
     def _depthwise_conv(self, conv_bias, factory_kwargs):
         return nn.Conv1d(
@@ -199,8 +196,8 @@ class Mamba(nn.Module):
             projection.bias.copy_(inverse_softplus)
         projection.bias._no_reinit = True
 
-    def _project_direction(self, x, x_projection, dt_projection, dtf, indicator):
-        # x is [B, D_inner, L]; DTF works on [B, L, D_inner].
+    def _project_direction(self, x, x_projection, dt_projection, mcssm, indicator):
+        # x is [B, D_inner, L]; MCSSM works on [B, L, D_inner].
         features = x.transpose(1, 2).contiguous()
         projected = x_projection(features)
         dt_rank, state_b, state_c = torch.split(
@@ -209,12 +206,12 @@ class Mamba(nn.Module):
             dim=-1,
         )
         dt_projected = dt_projection(dt_rank)
-        dtf_output = dtf(features, dt_projected, indicator)
+        mcssm_output = mcssm(features, dt_projected, indicator)
         return (
-            dtf_output.delta.transpose(1, 2).contiguous(),
+            mcssm_output.delta.transpose(1, 2).contiguous(),
             state_b.transpose(1, 2).contiguous(),
             state_c.transpose(1, 2).contiguous(),
-            dtf_output,
+            mcssm_output,
         )
 
     @staticmethod
@@ -257,11 +254,11 @@ class Mamba(nn.Module):
         a_x = self.act(self.a_conv1d(a_x)[..., :sequence_length])
         v_x = self.act(self.v_conv1d(v_x)[..., :sequence_length])
 
-        a_dt, a_b, a_c, a_dtf_f = self._project_direction(
-            a_x, self.a_x_proj, self.a_dt_proj, self.a_dtf, indicator
+        a_dt, a_b, a_c, a_mcssm_f = self._project_direction(
+            a_x, self.a_x_proj, self.a_dt_proj, self.a_mcssm, indicator
         )
-        v_dt, v_b, v_c, v_dtf_f = self._project_direction(
-            v_x, self.v_x_proj, self.v_dt_proj, self.v_dtf, indicator
+        v_dt, v_b, v_c, v_mcssm_f = self._project_direction(
+            v_x, self.v_x_proj, self.v_dt_proj, self.v_mcssm, indicator
         )
 
         a_xz_b = a_xz.flip(-1)
@@ -271,11 +268,11 @@ class Mamba(nn.Module):
         a_x_b = self.act(self.a_conv1d_b(a_x_b)[..., :sequence_length])
         v_x_b = self.act(self.v_conv1d_b(v_x_b)[..., :sequence_length])
         indicator_b = indicator.flip(1)
-        a_dt_b, a_b_b, a_c_b, a_dtf_b = self._project_direction(
-            a_x_b, self.a_x_proj_b, self.a_dt_proj_b, self.a_dtf, indicator_b
+        a_dt_b, a_b_b, a_c_b, a_mcssm_b = self._project_direction(
+            a_x_b, self.a_x_proj_b, self.a_dt_proj_b, self.a_mcssm, indicator_b
         )
-        v_dt_b, v_b_b, v_c_b, v_dtf_b = self._project_direction(
-            v_x_b, self.v_x_proj_b, self.v_dt_proj_b, self.v_dtf, indicator_b
+        v_dt_b, v_b_b, v_c_b, v_mcssm_b = self._project_direction(
+            v_x_b, self.v_x_proj_b, self.v_dt_proj_b, self.v_mcssm, indicator_b
         )
 
         state_a = -torch.exp(self.A_log.float())
@@ -331,10 +328,10 @@ class Mamba(nn.Module):
             a_out = a_out * self.a_gamma
             v_out = v_out * self.v_gamma
 
-        self.last_dtf_stats = {
-            "a_forward": self._diagnostic(a_dtf_f),
-            "a_backward": self._diagnostic(a_dtf_b),
-            "v_forward": self._diagnostic(v_dtf_f),
-            "v_backward": self._diagnostic(v_dtf_b),
+        self.last_mcssm_stats = {
+            "a_forward": self._diagnostic(a_mcssm_f),
+            "a_backward": self._diagnostic(a_mcssm_b),
+            "v_forward": self._diagnostic(v_mcssm_f),
+            "v_backward": self._diagnostic(v_mcssm_b),
         }
         return a_out, v_out
