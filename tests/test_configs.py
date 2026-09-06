@@ -26,9 +26,9 @@ class ConfigContractTest(unittest.TestCase):
                 tc = model["tc_mamba"]
                 tq = model["tq_mamba"]
 
-                self.assertNotIn("tmr", model)
-                self.assertNotIn("alpha", config["base"])
-                self.assertNotIn("rec_loss", config["base"])
+                self.assertIn("reconstruction", model)
+                self.assertIn("automatic_missingness", config["base"])
+                self.assertEqual(config["base"]["mcssm_indicator_source"], "automatic")
                 self.assertEqual(
                     (tc["num_layers"], tq["num_layers"]), expected["layers"]
                 )
@@ -38,7 +38,7 @@ class ConfigContractTest(unittest.TestCase):
                 self.assertEqual(tq["mamba_config"]["expand"], expected["expand"])
                 self.assertEqual(float(tc["dropout"]), expected["dropout"])
                 self.assertEqual(float(tq["dropout"]), expected["dropout"])
-                self.assertEqual(float(tc["dtf_threshold"]), 0.1)
+                self.assertNotIn("dtf_threshold", tc)
                 self.assertEqual(float(tq["rope_base"]), 10000.0)
 
     def test_english_feature_dimensions_match_manuscript(self):
@@ -56,7 +56,7 @@ class ConfigContractTest(unittest.TestCase):
                 self.assertEqual(config["base"]["seed"], 2024)
                 self.assertEqual(
                     config["base"]["validation_missing_rates"],
-                    [0.0, 0.1, 0.5, 0.9, 1.0],
+                    [0.0, 0.1, 0.3, 0.5, 0.7],
                 )
                 self.assertEqual(
                     config["base"]["validation_mask_seeds"],
