@@ -82,6 +82,25 @@ Feature dimensions:
 
 Please obtain each dataset from its official distributor and comply with its license and access conditions. Raw data are not redistributed by this repository.
 
+Place the released feature files and pretrained encoders under the repository root as follows:
+
+```text
+CMS-Mamba/
+├── data/
+│   ├── CMU_MOSI/Processed/unaligned_50.pkl
+│   ├── CMU_MOSEI/Processed/unaligned_50.pkl
+│   └── unaligned_39.pkl                 # CH-SIMS
+├── bert-base-uncased/                    # MOSI and MOSEI encoder
+└── bert-base-chinese/                    # CH-SIMS encoder
+```
+
+The six YAML files in `configs/` use relative paths from the repository root. Edit both the matching training and evaluation files if your data or pretrained encoder is stored elsewhere:
+
+- `dataset.dataPath` identifies the feature pickle file.
+- `model.feature_extractor.bert_pretrained` identifies the local Hugging Face BERT directory.
+
+For example, change these fields in both `configs/train_mosei.yaml` and `configs/eval_mosei.yaml` when CMU-MOSEI or `bert-base-uncased` is stored outside the repository. Use the analogous MOSI or CH-SIMS configuration pair for those datasets.
+
 ## Environment
 
 The reported experiments used:
@@ -95,19 +114,29 @@ The reported experiments used:
 | Transformers | 4.46.3 |
 | `mamba-ssm` | 2.2.2 |
 
-Install a PyTorch build compatible with the local CUDA stack, then install the remaining dependencies. Exact package commands may vary by platform.
+`environment.yml` pins the paper experiment environment rather than a separate compatibility stack. It requires an NVIDIA driver compatible with CUDA 12.6; building the Mamba extensions may also require a local CUDA 12.6 toolkit and `nvcc`.
 
 ```bash
-conda create -n cms-mamba python=3.10.12
+conda env create -f environment.yml
 conda activate cms-mamba
-
-# Install the appropriate PyTorch 2.5.0 build for your platform first.
-pip install transformers==4.46.3 mamba-ssm==2.2.2
 ```
 
 ## Reproduction protocol
 
-The repository entry-point filenames are not specified here because they were not part of the manuscript materials used to prepare this anonymous README. When connecting this document to the released source tree, preserve the protocol below and replace this note with the exact training and evaluation commands.
+Run commands from the repository root. The following CMU-MOSEI commands are directly copyable:
+
+```bash
+python train.py --config_file configs/train_mosei.yaml --seed 2024
+python robust_evaluation.py --config_file configs/eval_mosei.yaml --ckpt_path <checkpoint_path>
+```
+
+Training writes the validation-selected checkpoint to `ckpt/mosei/best_validation_MAE_2024.pth`; therefore, a concrete evaluation invocation is:
+
+```bash
+python robust_evaluation.py --config_file configs/eval_mosei.yaml --ckpt_path ckpt/mosei/best_validation_MAE_2024.pth
+```
+
+Use `train_mosi.yaml`/`eval_mosi.yaml` or `train_sims.yaml`/`eval_sims.yaml` for the other released sentiment datasets. The evaluation script also accepts `--pattern`, missing-rate, and mask-seed options; its defaults define a continuous 50% condition.
 
 1. Obtain the benchmark features and construct the fixed train/validation/test splits above.
 2. Fit feature standardization on the uncorrupted training split only.
