@@ -54,6 +54,7 @@ class EvaluationProtocolTest(unittest.TestCase):
         self.assertNotIn("strict=False", source)
         self.assertIn("text_valid_mask", source)
         self.assertIn("text_missing_mask", source)
+        self.assertIn("text_auto_missing_mask", source)
         self.assertIn('default="fp32"', source)
         self.assertNotIn("bfloat16", source)
 
