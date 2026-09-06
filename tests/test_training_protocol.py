@@ -12,25 +12,35 @@ from core.validation import (
 
 
 class TrainingProtocolTest(unittest.TestCase):
-    def test_loss_is_mse_only(self):
-        loss_fn = MultimodalLoss({})
-        out = {"sentiment_preds": torch.tensor([[1.0], [3.0]])}
-        labels = {"sentiment_labels": torch.tensor([[0.0], [1.0]])}
+    def test_loss_combines_mse_and_masked_smooth_l1_reconstruction(self):
+        loss_fn = MultimodalLoss(
+            {"model": {"reconstruction": {"loss_weight": 0.7}}}
+        )
+        out = {
+            "sentiment_preds": torch.tensor([[1.0], [3.0]]),
+            "reconstructed_text": torch.zeros(1, 2, 2),
+            "complete_text_features": torch.ones(1, 2, 2),
+        }
+        labels = {
+            "sentiment_labels": torch.tensor([[0.0], [1.0]]),
+            "text_reconstruction_mask": torch.tensor([[0.0, 1.0]]),
+        }
 
         result = loss_fn(out, labels)
 
-        self.assertEqual(set(result), {"loss", "l_sp"})
-        torch.testing.assert_close(result["loss"], torch.tensor(2.5))
+        self.assertEqual(set(result), {"loss", "l_sp", "l_rec"})
+        torch.testing.assert_close(result["l_rec"], torch.tensor(0.5))
+        torch.testing.assert_close(result["loss"], torch.tensor(2.85))
 
     def test_default_validation_grid_has_fifteen_conditions(self):
         grid = validation_grid(
-            (0.0, 0.1, 0.5, 0.9, 1.0),
+            (0.0, 0.1, 0.3, 0.5, 0.7),
             (1111, 2222, 3333),
         )
 
         self.assertEqual(len(grid), 15)
         self.assertEqual(grid[0], (0.0, 1111))
-        self.assertEqual(grid[-1], (1.0, 3333))
+        self.assertEqual(grid[-1], (0.7, 3333))
 
     def test_selector_uses_only_mean_validation_mae(self):
         selector = ValidationCheckpointSelector()
