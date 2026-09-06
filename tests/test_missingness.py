@@ -8,9 +8,13 @@ import numpy as np
 from core.dataset import MMDataset
 
 from core.missingness import (
+    automatic_continuous_missingness,
+    automatic_text_missingness,
     corrupt_continuous,
     corrupt_text,
     evaluation_missingness,
+    fit_continuous_feature_statistics,
+    standardize_received_continuous,
     training_missingness,
 )
 
@@ -83,6 +87,29 @@ class MissingnessTest(unittest.TestCase):
                 for name in ("text", "audio", "vision"):
                     self.assertTrue(np.all(getattr(result, name) <= self.valid[name]))
 
+    def test_automatic_continuous_detection_preserves_padding_and_requires_support(self):
+        train = np.array([[[1.0, 1.0], [3.0, 3.0], [0.0, 0.0]]])
+        stats = fit_continuous_feature_statistics(train, np.array([2]))
+        received = np.array([[0.0, 0.0], [1.01, 1.01], [0.0, 0.0]])
+        valid = np.array([1, 1, 0], dtype=bool)
+        standardized, direct = standardize_received_continuous(received, valid, stats)
+        detected = automatic_continuous_missingness(
+            standardized,
+            valid,
+            direct,
+            threshold=0.1,
+        )
+
+        self.assertTrue(detected[0])
+        self.assertFalse(detected[2])
+
+    def test_automatic_text_detection_excludes_boundary_and_padding_tokens(self):
+        detected = automatic_text_missingness(
+            np.array([101, 100, 100, 0]),
+            np.array([1, 1, 1, 0], dtype=bool),
+        )
+        np.testing.assert_array_equal(detected, [False, True, False, False])
+
     def test_dataset_exposes_explicit_valid_and_missing_masks(self):
         text = np.zeros((1, 3, 5), dtype=np.float32)
         text[0, 0] = [101, 11, 12, 102, 0]
@@ -119,6 +146,8 @@ class MissingnessTest(unittest.TestCase):
             valid = sample[f"{modality}_valid_mask"].numpy().astype(bool)
             missing = sample[f"{modality}_missing_mask"].numpy().astype(bool)
             self.assertTrue(np.all(missing <= valid))
+            auto = sample[f"{modality}_auto_missing_mask"].numpy().astype(bool)
+            self.assertTrue(np.all(auto <= valid))
         self.assertEqual(sample["text_m"][0, 0].item(), 101)
         self.assertEqual(sample["text_m"][0, 3].item(), 102)
 
