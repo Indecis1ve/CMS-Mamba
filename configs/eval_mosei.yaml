@@ -6,6 +6,10 @@ base:
   missing_pattern: continuous
   missing_rate_eval_test: [0.0, 0.0, 0.0]
   block_rate: 0.0
+  mcssm_indicator_source: automatic
+  automatic_missingness:
+    audio_threshold: 0.18
+    vision_threshold: 0.21
 
 dataset:
   datasetName: mosei
@@ -20,6 +24,10 @@ model:
     input_length: [50, 500, 500]
     input_dim: [768, 35, 74]
     hidden_dim: *com_dim
+  reconstruction:
+    output_dim: 768
+    dropout: *dropout
+    loss_weight: 0.3
   tc_mamba:
     num_layers: 2
     d_model: *com_dim
@@ -27,7 +35,6 @@ model:
     activation: GELU
     dropout: *dropout
     causal: false
-    dtf_threshold: 0.1
     mamba_config:
       d_state: 16
       expand: 4
