@@ -4,11 +4,13 @@ import unittest
 
 
 class ModelContractTest(unittest.TestCase):
-    def test_model_has_no_zero_heuristic_or_reconstruction_head(self):
+    def test_model_uses_automatic_masks_and_retains_the_reconstruction_head(self):
         source = Path("models/TFMamba.py").read_text(encoding="utf-8")
 
         self.assertNotIn("== 0).all", source)
-        self.assertNotIn("recon_text", source)
+        self.assertIn("text_reconstructor", source)
+        self.assertIn("automatic_missing_masks", source)
+        self.assertIn("conditioning_masks", source)
         self.assertIn("dim=-1", source)
 
     def test_model_preserves_branch_text_contexts_until_fusion(self):
