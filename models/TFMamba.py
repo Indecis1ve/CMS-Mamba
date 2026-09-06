@@ -33,10 +33,6 @@ class CMSMamba(nn.Module):
         )
 
         tc_args = model_args["tc_mamba"]
-        tc_mamba_config = dict(tc_args["mamba_config"])
-        tc_mamba_config["dtf_threshold"] = float(
-            tc_args.get("dtf_threshold", 0.1)
-        )
         self.text_based_context_mamba = TCMamba(
             num_layers=tc_args["num_layers"],
             d_model=tc_args["d_model"],
@@ -44,7 +40,7 @@ class CMSMamba(nn.Module):
             activation=tc_args["activation"],
             dropout=tc_args["dropout"],
             causal=tc_args["causal"],
-            mamba_config=tc_mamba_config,
+            mamba_config=dict(tc_args["mamba_config"]),
         )
 
         tq_args = model_args["tq_mamba"]
@@ -66,6 +62,17 @@ class CMSMamba(nn.Module):
         )
 
         regression_dim = int(model_args["regression"]["input_dim"])
+        reconstruction_args = model_args["reconstruction"]
+        reconstruction_dropout = float(reconstruction_args.get("dropout", 0.0))
+        self.text_reconstructor = nn.Sequential(
+            nn.Linear(regression_dim, regression_dim),
+            nn.ReLU(),
+            nn.Dropout(reconstruction_dropout),
+            nn.Linear(
+                regression_dim,
+                int(reconstruction_args.get("output_dim", 768)),
+            ),
+        )
         self.pool = nn.AdaptiveMaxPool1d(1)
         self.norm_lock = nn.LayerNorm(regression_dim)
         self.output = nn.Linear(
@@ -74,29 +81,59 @@ class CMSMamba(nn.Module):
         )
 
     @staticmethod
-    def _validate_text_mask(text_missing, text_valid):
-        if text_missing.shape != text_valid.shape:
-            raise ValueError("text missing and validity masks must have identical shapes")
-        missing = text_missing.to(dtype=torch.bool)
-        valid = text_valid.to(dtype=torch.bool)
+    def _validate_missing_mask(name, missing_mask, valid_mask):
+        if missing_mask.shape != valid_mask.shape:
+            raise ValueError(
+                f"{name} missing and validity masks must have identical shapes"
+            )
+        missing = missing_mask.to(dtype=torch.bool)
+        valid = valid_mask.to(dtype=torch.bool)
         if torch.any(missing & ~valid):
-            raise ValueError("text missing mask contains padding positions")
+            raise ValueError(f"{name} missing mask contains padding positions")
 
-    def forward(self, incomplete_input, missing_masks, valid_masks):
+    def forward(
+        self,
+        incomplete_input,
+        automatic_missing_masks,
+        valid_masks,
+        conditioning_masks=None,
+        complete_text=None,
+    ):
+        """Run CMS-Mamba with input-derived substitution and selected MCSSM masks.
+
+        ``automatic_missing_masks`` always controls LMMT substitution.  The
+        optional ``conditioning_masks`` selects the MCSSM signal, allowing a
+        reference-conditioned mechanism experiment without leaking reference
+        masks into the deployable input-stabilization path.
+        """
         vision, audio, language = incomplete_input
-        text_missing, audio_missing, vision_missing = missing_masks
+        text_auto_missing, audio_auto_missing, vision_auto_missing = (
+            automatic_missing_masks
+        )
         text_valid, audio_valid, vision_valid = valid_masks
-        self._validate_text_mask(text_missing, text_valid)
+        if conditioning_masks is None:
+            conditioning_masks = automatic_missing_masks
+        text_missing, audio_missing, vision_missing = conditioning_masks
+        self._validate_missing_mask("automatic text", text_auto_missing, text_valid)
+        self._validate_missing_mask("automatic audio", audio_auto_missing, audio_valid)
+        self._validate_missing_mask(
+            "automatic vision", vision_auto_missing, vision_valid
+        )
+        self._validate_missing_mask("conditioning text", text_missing, text_valid)
+        self._validate_missing_mask("conditioning audio", audio_missing, audio_valid)
+        self._validate_missing_mask(
+            "conditioning vision", vision_missing, vision_valid
+        )
 
         vision_stable = apply_missing_token(
             vision,
-            vision_missing,
+            vision_auto_missing,
             vision_valid,
             self.v_mask_token,
         )
         audio_stable = apply_missing_token(
             audio,
-            audio_missing,
+            audio_auto_missing,
             audio_valid,
             self.a_mask_token,
         )
@@ -126,7 +163,14 @@ class CMSMamba(nn.Module):
         fused = self.text_based_query_mamba(attended)
         pooled = self.pool(fused.transpose(1, 2)).squeeze(-1)
         prediction = self.output(self.norm_lock(pooled))
-        return {"sentiment_preds": prediction}
+        output = {"sentiment_preds": prediction}
+        if complete_text is not None:
+            if complete_text.ndim != 3:
+                raise ValueError("complete text input must have shape [B, 3, L]")
+            output["reconstructed_text"] = self.text_reconstructor(aligned.text)
+            with torch.no_grad():
+                output["complete_text_features"] = self.bertmodel(complete_text)
+        return output
 
 
 def build_model(args):
