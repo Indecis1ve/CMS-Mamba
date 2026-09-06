@@ -1,271 +1,225 @@
 # CMS-Mamba
 
-PyTorch implementation accompanying **Robust Multimodal Sentiment Analysis under Incomplete Observations via Missingness-Conditioned State-Space Modulation**.
+> Anonymous research repository. Author names, affiliations, contact details, and identifying repository links are intentionally withheld during peer review.
 
-**Authors:** Jie Hu, Qingxia Dang, and Ming Li  
-**Manuscript status:** Under review  
-**Repository:** [Indecis1ve/CMS-Mamba](https://github.com/Indecis1ve/CMS-Mamba)
+Official implementation of **“Robust Multimodal Sentiment Analysis under Incomplete Observations via Missingness-Conditioned State-Space Modulation.”**
 
-CMS-Mamba studies how recurrent states should evolve when textual, acoustic, or visual observations are incomplete. Its central mechanism, **Missingness-Conditioned Selective State-Space Modulation (MCSSM)**, conditions the effective discretization step of selective state-space layers on aligned features and missingness. The deployable **CMS-Mamba-Auto** variant estimates missingness from degraded inputs during both training and inference.
+CMS-Mamba is designed for multimodal sentiment analysis when acoustic and visual observations may be partially or completely unavailable. Its central component, **Missingness-Conditioned State-Space Modulation (MCSSM)**, uses explicit observation indicators to control state updates: reliable observations produce normal updates, whereas missing observations drive the effective state-space step toward zero and approximately preserve the previous latent state.
 
-The revised manuscript emphasizes controlled mechanism validation: MCSSM improves three matched Mamba-family backbones, while the complete framework combines MCSSM with supporting input substitution and pre-head normalization. The main contribution is missingness-conditioned state integration, rather than a claim of universal state-of-the-art performance.
+## Highlights
 
-## Model variants and terminology
+- Missingness-aware state-space updates for incomplete multimodal sequences.
+- Automatic missingness detection for acoustic and visual features.
+- Learned fallback tokens for missing acoustic and visual frames.
+- Training with sample-wise stochastic missing ratios from 0% to 100%.
+- Evaluation under clean inputs, seven acoustic/visual missingness patterns, distribution shift, and total modality absence.
+- Validation-based checkpoint selection and multi-seed statistical testing.
 
-| Name | Meaning | MCSSM conditioning |
-| --- | --- | --- |
-| CMS-Mamba-Auto | Complete deployable framework | Input-derived indicators during training and inference |
-| CMS-Mamba (Ref.) | Reference-conditioned mechanism control | Corruption-process indicators during training and evaluation |
-| Backbone + MCSSM-Auto | Cross-backbone mechanism-isolation variant | Automatic indicators; only MCSSM is added |
+## Method overview
 
-The cross-backbone variants do **not** add LMMT or additional pre-head normalization. Their results must not be confused with those of the complete CMS-Mamba-Auto framework.
-
-Earlier documentation used **DTF** for state-update control and **RNL** for prediction-stage normalization. This README follows the revised manuscript: **MCSSM** is the state-space contribution, **LMMT** is a supporting learned-placeholder design, and **pre-head LayerNorm** is a standard normalization component.
-
-## Installation
-
-The documented repository entry points use a Conda environment and a CUDA-enabled PyTorch installation:
-
-```bash
-git clone https://github.com/Indecis1ve/CMS-Mamba.git
-cd CMS-Mamba
-conda env create -f environment.yml
-conda activate CMSmamba
+```mermaid
+flowchart TD
+    A[Text, acoustic, and visual features] --> B[Missingness detection]
+    B --> C[Learned fallback replacement]
+    C --> D[Text-aware temporal alignment]
+    D --> E[MCSSM encoders]
+    E --> F[Cross-modal fusion]
+    F --> G[Sentiment prediction]
 ```
 
-The reference software stack reported in the revised manuscript is:
+For an input $x_t$ and observation indicator $m_t$, MCSSM computes
 
-| Component | Reported version |
-| --- | --- |
+$$\alpha_t=\sigma(W_gx_t+W_mm_t+b_g), \qquad \Delta_t=\alpha_t\odot\operatorname{Softplus}(W_\Delta x_t+b_\Delta).$$
+
+The modulated step $\Delta_t$ is used in the zero-order-hold discretization of the state-space model. As $\Delta_t\rightarrow0$, the transition approaches the identity and the input contribution approaches zero, so the latent state is approximately retained instead of being overwritten by an unreliable observation.
+
+The learned missing-modality tokens and automatic detector support the full system but are not presented as the paper's primary methodological contribution.
+
+## Missingness handling
+
+### Acoustic and visual streams
+
+Missingness is detected before fallback replacement and temporal alignment. A frame is marked missing when it is non-finite or exactly zero. The automatic detector additionally uses the standardized frame-energy score
+
+$$q_t=\lVert \widetilde{x}_t\rVert_2/\sqrt{d},$$
+
+where feature standardization is fitted only on the uncorrupted training split. A low-energy frame is marked missing only when an adjacent valid frame is also below the selected threshold, reducing isolated false alarms.
+
+The validation-selected acoustic/visual thresholds used in the experiments are:
+
+| Dataset | Acoustic | Visual |
+|---|---:|---:|
+| CMU-MOSI | 0.16 | 0.19 |
+| CMU-MOSEI | 0.18 | 0.21 |
+| CH-SIMS | 0.14 | 0.23 |
+| IEMOCAP | 0.17 | 0.20 |
+
+For CMU-MOSEI, the final common threshold scale was selected from $\{0.8,0.9,1.0,1.1,1.2\}$ using incomplete-input validation MAE on a frozen development checkpoint; the selected scale was 1.0.
+
+### Text stream
+
+Missing non-special text tokens are represented by `[UNK]`. Special tokens remain observed. Acoustic and visual indicators are aligned with the same text-aware alignment operators used for their corresponding features.
+
+## Data and features
+
+This work uses public benchmark features and the following fixed splits:
+
+| Dataset | Task | Train | Validation | Test |
+|---|---|---:|---:|---:|
+| CMU-MOSI | Sentiment regression | 1,284 | 229 | 686 |
+| CMU-MOSEI | Sentiment regression | 16,326 | 1,871 | 4,659 |
+| CH-SIMS | Sentiment regression | 1,368 | 456 | 457 |
+| IEMOCAP | Four-class emotion recognition | 3,259 | 1,031 | 1,241 |
+
+IEMOCAP uses Sessions 1–3 for training, Session 4 for validation, and Session 5 for testing. The four classes are angry, happy (including excited), sad, and neutral.
+
+Feature dimensions:
+
+| Dataset group | Text | Acoustic | Visual |
+|---|---:|---:|---:|
+| CMU-MOSI / CMU-MOSEI / IEMOCAP | BERT, 768 | COVAREP, 74 | FACET, 35 |
+| CH-SIMS | Chinese BERT, 768 | Librosa, 33 | OpenFace, 709 |
+
+Please obtain each dataset from its official distributor and comply with its license and access conditions. Raw data are not redistributed by this repository.
+
+## Environment
+
+The reported experiments used:
+
+| Component | Version |
+|---|---|
 | Python | 3.10.12 |
 | PyTorch | 2.5.0 |
 | CUDA | 12.6 |
-| cuDNN | 9.3.0 |
+| cuDNN | 9.3 |
 | Transformers | 4.46.3 |
-| mamba-ssm | 2.2.2 |
+| `mamba-ssm` | 2.2.2 |
 
-Use CUDA extensions compatible with the selected PyTorch/CUDA stack, including the selective-scan and causal-convolution dependencies. Jetson/ARM installations require platform-compatible builds. The software stack above describes the manuscript experiments; it does not imply that a server environment can be copied unchanged to Jetson.
-
-## Data preparation
-
-The sentiment experiments use the official TF-Mamba feature release and the corresponding dataset splits.
-
-| Dataset | Text encoder | Acoustic features | Visual features | Maximum aligned length |
-| --- | --- | --- | --- | --- |
-| CMU-MOSI | BERT-base, 768 dimensions | COVAREP, 74 dimensions | FACET, 35 dimensions | 50 |
-| CMU-MOSEI | BERT-base, 768 dimensions | COVAREP, 74 dimensions | FACET, 35 dimensions | 50 |
-| CH-SIMS | BERT-base-Chinese, 768 dimensions | Librosa, 33 dimensions | OpenFace 2.0, 709 dimensions | 39 |
-
-The documented data and pretrained-encoder layout is shown below. Adjust the dataset and encoder paths in the YAML configuration files to match your installation:
-
-```text
-data/CMU_MOSI/unaligned_50.pkl
-data/CMU_MOSEI/unaligned_50.pkl
-data/CH_SIMS/unaligned_50.pkl
-bert-base-uncased/
-bert-base-chinese/
-```
-
-The processed-file name does not define the model's aligned sequence length; use the dataset-specific configuration. Keep the official train/validation/test split separation when preparing features and calibrating the missingness estimator.
-
-## Training and evaluation
-
-The commands below retain the repository's documented MOSI, MOSEI, and CH-SIMS entry points.
-
-### Training
+Install a PyTorch build compatible with the local CUDA stack, then install the remaining dependencies. Exact package commands may vary by platform.
 
 ```bash
-python train.py --config_file configs/train_mosi.yaml
-python train.py --config_file configs/train_mosei.yaml
-python train.py --config_file configs/train_sims.yaml
+conda create -n cms-mamba python=3.10.12
+conda activate cms-mamba
+
+# Install the appropriate PyTorch 2.5.0 build for your platform first.
+pip install transformers==4.46.3 mamba-ssm==2.2.2
 ```
 
-### Robustness evaluation
+## Reproduction protocol
 
-```bash
-python robust_evaluation.py --config_file configs/eval_mosi.yaml
-python robust_evaluation.py --config_file configs/eval_mosei.yaml
-python robust_evaluation.py --config_file configs/eval_sims.yaml
-```
+The repository entry-point filenames are not specified here because they were not part of the manuscript materials used to prepare this anonymous README. When connecting this document to the released source tree, preserve the protocol below and replace this note with the exact training and evaluation commands.
 
-The documented output locations are `ckpt/` for checkpoints and `log/results/` for evaluation results. Configure data, pretrained-encoder, and checkpoint paths before running the scripts. For manuscript comparisons, distinguish the Auto and Ref. protocols defined above and use matching configurations and checkpoints.
+1. Obtain the benchmark features and construct the fixed train/validation/test splits above.
+2. Fit feature standardization on the uncorrupted training split only.
+3. During training, sample one missing ratio $\eta\sim\mathcal{U}(0,1)$ per example and apply Bernoulli masks to eligible positions in the acoustic and visual streams.
+4. Optimize the sentiment objective together with masked Smooth-L1 reconstruction on artificially removed observations.
+5. Select checkpoints using the lowest mean validation MAE over $\eta\in\{0,0.1,0.3,0.5,0.7\}$ and three fixed validation masks.
+6. Evaluate clean inputs and the seven acoustic/visual corruption patterns using independent test masks.
+7. Report results over five model seeds: 2024, 2025, 2026, 2027, and 2028.
 
-## Method
+The validation mask seeds are 1111, 2222, and 3333. The test mask seeds are 1111, 2222, 3333, 4444, and 5555.
 
-### MCSSM: control of state-space integration
+## Training configuration
 
-For an aligned representation $x_t$ and its branch-specific missingness vector $m_t$, MCSSM computes
+Shared settings:
 
-$$
-\alpha_t = \sigma(W_g x_t + W_m m_t + b_g),
-\qquad
-\Delta_{\mathrm{base},t} = \mathrm{Softplus}(W_\Delta x_t + b_\Delta),
-\qquad
-\Delta_t = \alpha_t \Delta_{\mathrm{base},t}.
-$$
+- Optimizer: AdamW
+- Initial learning rate: $10^{-4}$
+- Weight decay: $10^{-4}$
+- Schedule: 10% warm-up followed by cosine decay
+- Batch size: 64
+- Maximum epochs: 200
+- Early-stopping patience: 20
+- Gradient clipping: 1.0
+- Training precision: FP32
+- Hidden dimension: 128
+- Attention heads: 8
 
-The effective step controls both terms of the zero-order-hold state update:
+Dataset-specific settings:
 
-$$
-\bar A_t = \exp(\Delta_t A),
-\qquad
-\bar B_t = \int_0^{\Delta_t}\exp((\Delta_t-\tau)A)B\,d\tau,
-\qquad
-h_t = \bar A_t h_{t-1} + \bar B_t x_t.
-$$
+| Dataset | Context/query layers | SSM state size | Expansion | Dropout | Reconstruction weight |
+|---|---:|---:|---:|---:|---:|
+| CMU-MOSI | 1 / 1 | 12 | 4 | 0.1 | 0.7 |
+| CMU-MOSEI | 2 / 2 | 16 | 4 | 0.2 | 0.3 |
+| CH-SIMS | 1 / 2 | 16 | 2 | 0.2 | 1.0 |
 
-As the effective step approaches zero, the transition approaches the identity and input injection approaches zero. A positive step can instead integrate a learned fallback representation. MCSSM therefore regulates recurrent integration, rather than simply dropping features or multiplying the output of an already completed recurrent update.
+All configurations use convolution kernel size 4. IEMOCAP uses cross-entropy plus reconstruction loss with reconstruction weight 0.3 and no class weighting.
 
-The integration gate $\alpha_t$ is not a calibrated missingness probability. The same continuous integration rule is used in training and inference; no separate hard-freeze threshold is introduced.
+## Main results
 
-### Supporting components
+### CMU-MOSEI
 
-- **LMMT:** two jointly learned modality-specific vectors replace detected missing acoustic and visual frames before alignment. They provide stable fallback representations, not reconstruction of unavailable semantic content.
-- **Inherited backbone:** text-aware alignment, multimodal fusion, and the text-reconstruction branch and objective are retained from TF-Mamba.
-- **Pre-head LayerNorm:** standard normalization limits pooled-feature scale variation before regression.
+CMS-Mamba-Auto achieves the following five-seed results:
 
-The manuscript reports all eight LMMT/MCSSM/pre-head-normalization combinations, with RoPE fixed, and a separate RoPE ablation. Complete-framework gains are not attributed to MCSSM alone.
+| Setting | MAE ↓ | Correlation ↑ | F1 ↑ |
+|---|---:|---:|---:|
+| Clean input | 0.5491 ± 0.0018 | 0.7598 ± 0.0024 | 0.8076 ± 0.0015 |
+| Seven-pattern macro | 0.6775 ± 0.0015 | 0.5791 ± 0.0023 | 0.7326 ± 0.0018 |
 
-### Automatic missingness estimation
+Against the TF-Mamba backbone, the seven-pattern macro MAE improves from 0.6979 to 0.6775, a paired reduction of 0.0204 with 95% confidence interval $[0.0130,0.0278]$, Holm-adjusted $p=0.0031$, and $d_z=3.42$.
 
-For continuous modality $m$, the score is computed before substitution and alignment:
+Adding MCSSM-Auto consistently improves three Mamba-family backbones:
 
-$$
-q_{m,t} = \frac{\lVert\widetilde{x}_{m,t}\rVert_2}{\sqrt{d_m}}.
-$$
+| Backbone | Original MAE ↓ | + MCSSM-Auto MAE ↓ | Reduction |
+|---|---:|---:|---:|
+| TF-Mamba | 0.6979 | 0.6863 | 0.0116 |
+| MSL-Mamba | 0.6748 | 0.6671 | 0.0077 |
+| Vanilla Mamba | 0.7162 | 0.7029 | 0.0133 |
 
-Exactly zero or non-finite frames are marked missing directly. A nonzero low-energy frame is marked missing when its score and at least one valid temporal neighbor's score are below the modality-specific threshold. Text uses non-special `[UNK]` token positions; `[CLS]` and `[SEP]` remain observed, and padding is excluded.
+MSL-Mamba with MCSSM-Auto is the strongest deployable configuration tested in the cross-backbone comparison, with macro MAE 0.6671. Several strong baselines have lower point estimates than CMS-Mamba-Auto in the main comparison, but the differences are not significant after Holm correction; the paper therefore does not claim universal state-of-the-art performance.
 
-For each dataset-seed run, feature standardization is fitted on the training split and thresholds are calibrated on the validation split by missing-class F1. Test data and sentiment labels are not used to fit these preprocessing rules. The nominal CMU-MOSEI thresholds are **0.18 for audio** and **0.21 for vision**; these are not universal thresholds for arbitrary feature extractors.
+### Cross-dataset results
 
-The processing order is:
+| Dataset | Summary |
+|---|---|
+| CH-SIMS | Clean MAE improves from 0.4492 to 0.4421 and clean binary accuracy from 73.52% to 77.84%. At the most severe endpoint, binary accuracy improves from 60.61% to 65.18%, while MAE changes from 0.6513 to 0.6584, showing a metric trade-off. |
+| IEMOCAP | Incomplete-input weighted F1 improves from 63.17% to 65.28%; gain 2.11 points, 95% CI $[0.88,3.34]$, $p=0.009$. |
 
-1. Standardize received continuous features using training-split statistics.
-2. Estimate raw-frame and token missingness, excluding padding and respecting valid temporal boundaries.
-3. Apply LMMT substitution to detected missing continuous frames; represent text corruption through `[UNK]` substitution before BERT encoding.
-4. Align features and propagate the selected MCSSM indicators through the same text-centric alignment matrices.
-5. Construct visual-text and acoustic-text missingness vectors and run MCSSM in both TC-Mamba branches.
-6. Apply the inherited fusion pathway, pooling, pre-head normalization, and prediction head.
+Under out-of-distribution corruption schedules, the method improves mean MAE in 11 of 12 settings, with an average reduction of 0.0180.
 
-The indicator thresholding operation is discrete. Training gradients propagate through the selected learned tokens, alignment, MCSSM, and downstream modules, but not through the heuristic threshold decisions.
+## Efficiency
 
-In reference-conditioned controls, only the MCSSM conditioning signal is replaced with corruption-process indicators. LMMT retains its input-derived substitution decision.
+| Model | Parameters | MACs |
+|---|---:|---:|
+| TF-Mamba | 3.24 M | 0.86 G |
+| CMS-Mamba-Auto | 3.31 M | 0.89 G |
 
-## Experimental protocol
+On the evaluated Jetson setup at batch size 16, end-to-end latency is approximately 80.66–81.15 ms for CMS-Mamba-Auto and 90.35–90.62 ms for TF-Mamba. The measured speedup is implementation-specific and is attributed to contiguous layouts and cached tensors, not to lower theoretical complexity. Energy per batch is higher for CMS-Mamba-Auto in the clean setting (0.0501 J versus 0.0407 J).
 
-- **Training seeds:** 2024, 2025, 2026, 2027, and 2028 for the main five-seed experiments.
-- **Validation mask seeds:** 1111, 2222, and 3333.
-- **Test mask seeds:** 1111, 2222, 3333, 4444, and 5555 for stochastic patterns.
-- **Checkpoint selection:** lowest validation MAE over missing rates 0.0, 0.1, 0.3, 0.5, and 0.7 and the three validation mask seeds; all metrics use the same selected checkpoint.
-- **Seven-pattern incomplete macro:** Block 30%, Block 50%, Text Missing, A+V Missing, Text-heavy, A/V-heavy, and Mixed burst. Clean input is excluded.
-- **Continuous-rate summary:** the evaluated grid within $\eta\in[0.0,0.9]$, excluding the total-missingness endpoint.
-- **Uncertainty:** mean and sample standard deviation across training seeds. Stochastic realizations are averaged within each seed before computing the macro score and across-seed SD.
-- **Statistical comparisons:** paired differences and 95% confidence intervals use matched seeds; Holm correction is applied separately to the explicitly defined comparison families.
+These end-to-end measurements start from released feature sequences and therefore exclude raw audio/video feature extraction and text encoding.
 
-The TF-Mamba/CMS-Mamba training setup uses AdamW, learning rate $10^{-4}$, weight decay $10^{-4}$, batch size 64, up to 200 epochs, and 10% warm-up followed by cosine annealing. The inherited reconstruction-loss weights are 0.7 for MOSI, 0.3 for MOSEI, and 1.0 for CH-SIMS. Full configuration details and comparison controls are given in the manuscript and supplementary material.
+## Evaluation notes
 
-At $\eta=1.0$, all mask-eligible observations are removed, while boundary-token structure and learned continuous-modality fallback representations remain. Endpoint performance characterizes fallback behavior under this protocol, not recovery of the removed semantic content.
+- The seven-pattern macro averages clean input and six non-clean acoustic/visual missingness conditions.
+- Exact-zero and non-finite observations are hard-covered by the detector in the controlled protocol.
+- Detector quality alone does not determine downstream accuracy: the learned detector obtains higher frame-level F1 than the heuristic detector but slightly worse downstream MAE.
+- Report both clean and incomplete-input performance because robustness gains can involve dataset- and metric-specific trade-offs.
+- Total modality absence evaluates fallback behavior, not semantic reconstruction of information that was never observed.
 
-## Results from the revised manuscript
+## Limitations
 
-The following results are from the revised manuscript and supplementary material. Unless stated otherwise, uncertainty is the sample SD across five training seeds. Lower MAE is better.
-
-### Deployable CMU-MOSEI comparison
-
-Selected matched-protocol results for the seven-pattern incomplete-input macro MAE:
-
-| Model | Macro MAE, mean ± sample SD |
-| --- | --- |
-| TF-Mamba | 0.6979 ± 0.0066 |
-| Retrained no-indicator model | 0.6846 ± 0.0057 |
-| **CMS-Mamba-Auto** | **0.6775 ± 0.0015** |
-| LNLN | 0.6737 ± 0.0060 |
-| APRD | 0.6742 ± 0.0049 |
-| MSLMamba | 0.6748 ± 0.0054 |
-| EASE | 0.6755 ± 0.0053 |
-| CTRN | 0.6768 ± 0.0039 |
-
-CMS-Mamba-Auto reduces MAE relative to TF-Mamba by **0.0204**, with paired 95% CI **[0.0130, 0.0278]** and two-test Holm **p = 0.0031**. Its complete-input MAE is **0.5491 ± 0.0018**.
-
-The five recent baselines listed below CMS-Mamba-Auto have lower macro-MAE point estimates, but their paired differences from Auto are not significant after the separate five-test Holm correction. This does not establish equivalence; the contribution is evaluated through matched-backbone and mechanism controls.
-
-The reference-conditioned CMS-Mamba control reaches **0.6731 ± 0.0022** macro MAE. It uses reference indicators for MCSSM and is not part of the deployable-model ranking.
-
-For Auto versus the retrained no-indicator model, the prespecified five-seed comparison has Holm **p = 0.0740**. The separately extended eight-seed pairing gives the same **0.0071** reduction, paired 95% CI **[0.0027, 0.0115]**, and **unadjusted p = 0.0067**. These two analyses retain their separate statistical interpretations.
-
-### Cross-backbone portability: only MCSSM-Auto added
-
-No LMMT or additional pre-head normalization is added in these comparisons. Training settings are matched within each backbone, and automatic indicators are used during both training and evaluation.
-
-| Backbone | Original macro MAE | + MCSSM-Auto macro MAE | Paired reduction [95% CI] | Holm p |
-| --- | --- | --- | --- | --- |
-| TF-Mamba | 0.6979 ± 0.0066 | 0.6863 ± 0.0048 | 0.0116 [0.0069, 0.0163] | 0.0072 |
-| MSLMamba | 0.6748 ± 0.0054 | 0.6671 ± 0.0046 | 0.0077 [0.0021, 0.0133] | 0.0186 |
-| Vanilla early-fusion Mamba | 0.7162 ± 0.0029 | 0.7029 ± 0.0058 | 0.0133 [0.0076, 0.0190] | 0.0072 |
-
-All three paired reductions remain significant after correction across the three backbone comparisons. Confidence intervals are unadjusted paired 95% intervals; the p values are Holm-adjusted.
-
-### Mechanism, detector, and fallback controls
-
-- **Conditioning location:** with the other components fixed and reference indicators supplied, MCSSM significantly improves on binary step freezing and input-feature gating under both Text Missing and total missingness. It also improves on output-representation gating at total missingness. These are five significant contrasts in the shared 16-test Holm family. Differences from additive-step, indicator-only, and feature-only step modulation are not resolved after correction.
-- **Mean rankings:** MCSSM has the lowest mean MAE for Block 50%, Text Missing, Mixed burst, and total missingness in the location comparison. Under A+V Missing, the hidden-state gate is slightly lower: 0.5747 versus 0.5749.
-- **Matched dropout controls:** CMS-Mamba-Auto reduces macro MAE by 0.0138 versus feature dropout and 0.0087 versus modality dropout; both two-test Holm p values are 0.0003. These are complete-framework comparisons, distinct from the MCSSM-only portability experiment.
-- **Learned detector:** a lightweight MLP improves missingness-detection macro F1 from 0.934 to 0.948, but increases downstream macro MAE from 0.6775 to 0.6783. Learned-minus-heuristic MAE is +0.0008, paired 95% CI [0.0003, 0.0013], p = 0.0155. The heuristic is therefore retained for the reported end-to-end pipeline.
-- **LMMT alternatives:** LMMT improves over zero vectors, train-split means, and training-set k-means prototypes under both Text Missing and total missingness; all six Holm-adjusted p values are at most 0.0147. Training-set prototypes are distinct from representations supplied by external pretrained modality encoders.
-
-### Distribution, dataset, and task coverage
-
-- **OOD perturbations:** without retraining for each listed perturbation, Auto has lower mean MAE in 11 of 12 feature/text-space conditions, with a mean reduction of 0.0180 across all 12. Mild FACET temporal smoothing is the exception, with Auto higher by 0.0004. The same 11 improved conditions also have smaller across-seed MAE SDs.
-- **CMU-MOSI continuous missingness:** the reference-conditioned model lowers trajectory-average MAE from 1.0735 ± 0.0163 to 1.0562 ± 0.0127 and improves Mult-7/Mult-5 by 2.45/3.70 percentage points. Its Has0 F1 is higher at the total-missingness endpoint, but does not consistently exceed TF-Mamba at intermediate missing rates.
-- **CH-SIMS:** Auto lowers complete-input MAE from 0.4492 to 0.4421 and improves Acc-2 from 73.52% to 77.84%. At total missingness, Acc-2 improves from 60.61% to 65.18%, while MAE increases from 0.6513 to 0.6584. All four corresponding paired differences survive the four-test Holm correction. This is cross-dataset applicability with dataset-specific training, not zero-shot cross-lingual transfer.
-- **IEMOCAP emotion recognition:** the session-independent four-class experiment extends evaluation beyond sentiment regression. Incomplete-macro WF1 increases from 63.17 ± 0.88 to 65.28 ± 0.81; the paired gain is 2.11 points, 95% CI [0.88, 3.34], p = 0.0090.
-
-The extended experiments are specified in the revised manuscript and supplementary material; the quick-start commands above cover the existing documented sentiment-dataset entry points.
-
-## Computational and deployment measurements
-
-The complete CMS-Mamba-Auto framework has **3.31M parameters and 0.89G MACs**, compared with **3.24M and 0.86G** for TF-Mamba.
-
-| Model / inference path | A30 FP32 latency (ms/sample) | Jetson FP16 latency (ms/B16) | Jetson energy (J/sample) |
-| --- | --- | --- | --- |
-| TF-Mamba | 2.84 ± 0.09 | 90.51 ± 1.84 | 0.0407 |
-| CMS-Mamba-Auto Core | 2.71 ± 0.08 | 79.70 ± 1.53 | 0.0491 |
-| CMS-Mamba-Auto E2E | 2.75 ± 0.08 | 80.82 ± 1.61 | 0.0501 |
-
-Timing uncertainty is mean ± sample SD over 30 synchronized runs after warm-up. Jetson measurements use AGX Orin 32 GB, FP16, MAXN mode, locked clocks, and active cooling.
-
-- **Core** uses precomputed automatic indicators and excludes detector preprocessing.
-- **E2E** includes automatic missingness estimation and associated preprocessing, LMMT substitution, alignment, state-space processing, and prediction. The A30 E2E value, **2.75 ± 0.08 ms/sample**, is directly measured.
-- These are **feature-level** end-to-end measurements: upstream raw audio/video feature extraction and text encoding are outside the timed region.
-- Across Clean, Block 50%, Text Missing, and A+V Missing on Jetson at batch size 16, preprocessing accounts for **1.30–1.61% of total E2E latency**. The denominator is E2E latency, not Core latency.
-- The no-indicator runtime row in the supplementary material is a separately retrained graph, not a subtraction-based estimate of detector cost.
-
-CMS-Mamba-Auto is faster under the reported runtime, but consumes more recorded energy per sample than TF-Mamba. Parameter counts, MACs, latency, and energy describe different properties; the results support low added complexity and lower measured latency, not a general energy-efficiency advantage.
-
-## Scope and open directions
-
-Current evidence covers three Mamba-family backbones, controlled missingness, feature/text-space OOD perturbations, sentiment analysis, and preliminary emotion classification. Future work includes transfer across feature extractors and model families, task-aware learned missingness detection, external pretrained fallback representations, and joint optimization of robustness, latency, and energy under raw-sensor deployment.
+- Detector thresholds may require validation-based recalibration under different feature scaling or preprocessing pipelines.
+- Experiments use released features and transcripts rather than raw sensor streams.
+- Cross-backbone evidence is limited to three Mamba-family models.
+- External pretrained fallback models were not evaluated.
+- Edge measurements cover one hardware platform and one implementation.
+- Results under complete modality removal should not be interpreted as recovery of missing semantic content.
 
 ## Citation
 
-The manuscript is under review. Please use the current title and complete author list:
+Citation metadata are anonymized during review:
 
 ```bibtex
-@misc{hu2026cmsmamba,
-  title  = {Robust Multimodal Sentiment Analysis under Incomplete Observations via Missingness-Conditioned State-Space Modulation},
-  author = {Hu, Jie and Dang, Qingxia and Li, Ming},
-  year   = {2026},
-  note   = {Manuscript under review},
-  url    = {https://github.com/Indecis1ve/CMS-Mamba}
+@article{anonymous2026cmsmamba,
+  title   = {Robust Multimodal Sentiment Analysis under Incomplete Observations via Missingness-Conditioned State-Space Modulation},
+  author  = {Anonymous},
+  year    = {2026},
+  note    = {Manuscript under anonymous review}
 }
 ```
 
-## License
+Please replace this entry with the final bibliographic record after the review process.
 
-This project is released under the MIT License. Third-party datasets, pretrained models, and dependencies remain subject to their respective licenses.
+## Anonymous-review notice
 
-## Acknowledgments
-
-This work was supported by the Engineering Research Center of Hubei Province for Clothing Information Program (No. 184084004).
-
-We thank the creators and maintainers of CMU-MOSI, CMU-MOSEI, CH-SIMS, IEMOCAP, Mamba, TF-Mamba, and the open-source multimodal learning community.
+This repository is provided solely to support reproducibility during anonymous peer review. Please avoid opening issues or discussions that attempt to identify the authors. Identifying metadata and permanent archival links will be added after the review process.
