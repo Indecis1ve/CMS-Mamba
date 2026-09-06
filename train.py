@@ -27,13 +27,18 @@ def parse_args():
     return parser.parse_args()
 
 
-def batch_to_model_inputs(data, device):
+def batch_to_model_inputs(data, device, indicator_source="automatic"):
     incomplete_input = (
         data["vision_m"].to(device),
         data["audio_m"].to(device),
         data["text_m"].to(device),
     )
-    missing_masks = (
+    automatic_masks = (
+        data["text_auto_missing_mask"].to(device),
+        data["audio_auto_missing_mask"].to(device),
+        data["vision_auto_missing_mask"].to(device),
+    )
+    reference_masks = (
         data["text_missing_mask"].to(device),
         data["audio_missing_mask"].to(device),
         data["vision_missing_mask"].to(device),
@@ -43,21 +48,51 @@ def batch_to_model_inputs(data, device):
         data["audio_valid_mask"].to(device),
         data["vision_valid_mask"].to(device),
     )
-    labels = {"sentiment_labels": data["labels"]["M"].to(device)}
-    return incomplete_input, missing_masks, valid_masks, labels
+    normalized_source = str(indicator_source).lower()
+    if normalized_source == "automatic":
+        conditioning_masks = automatic_masks
+    elif normalized_source == "reference":
+        conditioning_masks = reference_masks
+    else:
+        raise ValueError(
+            "mcssm_indicator_source must be 'automatic' or 'reference'"
+        )
+    labels = {
+        "sentiment_labels": data["labels"]["M"].to(device),
+        "text_reconstruction_mask": reference_masks[0],
+    }
+    return (
+        incomplete_input,
+        automatic_masks,
+        conditioning_masks,
+        valid_masks,
+        data["text"].to(device),
+        labels,
+    )
 
 
-def train_epoch(model, train_loader, optimizer, loss_fn, device):
+def train_epoch(model, train_loader, optimizer, loss_fn, device, indicator_source):
     model.train()
     losses = []
     predictions, targets = [], []
 
     for data in train_loader:
-        incomplete_input, missing_masks, valid_masks, labels = batch_to_model_inputs(
-            data, device
-        )
+        (
+            incomplete_input,
+            automatic_masks,
+            conditioning_masks,
+            valid_masks,
+            complete_text,
+            labels,
+        ) = batch_to_model_inputs(data, device, indicator_source)
         optimizer.zero_grad(set_to_none=True)
-        output = model(incomplete_input, missing_masks, valid_masks)
+        output = model(
+            incomplete_input,
+            automatic_masks,
+            valid_masks,
+            conditioning_masks=conditioning_masks,
+            complete_text=complete_text,
+        )
         loss = loss_fn(output, labels)["loss"]
         loss.backward()
         optimizer.step()
@@ -72,15 +107,25 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device):
 
 
 @torch.no_grad()
-def evaluate(model, eval_loader, device, metrics):
+def evaluate(model, eval_loader, device, metrics, indicator_source):
     model.eval()
     predictions, targets = [], []
 
     for data in eval_loader:
-        incomplete_input, missing_masks, valid_masks, labels = batch_to_model_inputs(
-            data, device
+        (
+            incomplete_input,
+            automatic_masks,
+            conditioning_masks,
+            valid_masks,
+            _,
+            labels,
+        ) = batch_to_model_inputs(data, device, indicator_source)
+        output = model(
+            incomplete_input,
+            automatic_masks,
+            valid_masks,
+            conditioning_masks=conditioning_masks,
         )
-        output = model(incomplete_input, missing_masks, valid_masks)
         predictions.append(output["sentiment_preds"].cpu())
         targets.append(labels["sentiment_labels"].cpu())
 
@@ -92,7 +137,7 @@ def evaluate(model, eval_loader, device, metrics):
 
 
 def evaluate_validation_grid(model, valid_loader, device, metrics, base_args):
-    rates = base_args.get("validation_missing_rates", [0.0, 0.1, 0.5, 0.9, 1.0])
+    rates = base_args.get("validation_missing_rates", [0.0, 0.1, 0.3, 0.5, 0.7])
     seeds = base_args.get("validation_mask_seeds", [1111, 2222, 3333])
     conditions = validation_grid(rates, seeds)
     condition_results = []
@@ -103,7 +148,13 @@ def evaluate_validation_grid(model, valid_loader, device, metrics, base_args):
             rates=(missing_rate, missing_rate, missing_rate),
             seed=mask_seed,
         )
-        result, selection_mae = evaluate(model, valid_loader, device, metrics)
+        result, selection_mae = evaluate(
+            model,
+            valid_loader,
+            device,
+            metrics,
+            base_args.get("mcssm_indicator_source", "automatic"),
+        )
         condition_results.append(
             {
                 "missing_rate": missing_rate,
@@ -144,11 +195,17 @@ def main():
         args["dataset"]["datasetName"]
     )
     selector = ValidationCheckpointSelector()
+    indicator_source = args["base"].get("mcssm_indicator_source", "automatic")
 
     for epoch in range(1, int(args["base"]["n_epochs"]) + 1):
         data_loaders["train"].dataset.set_epoch(epoch)
         loss, predictions, targets = train_epoch(
-            model, data_loaders["train"], optimizer, loss_fn, device
+            model,
+            data_loaders["train"],
+            optimizer,
+            loss_fn,
+            device,
+            indicator_source,
         )
         train_metrics = metrics(predictions, targets)
         print(f"Epoch {epoch} train MSE: {loss:.6f}; metrics: {train_metrics}")
